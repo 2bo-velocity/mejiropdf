@@ -1,0 +1,52 @@
+{
+    "name": "2bo-velocity/mejiropdf",
+    "description": "A modern, stream-first, and memory-efficient PDF generation engine for PHP 8.3+.",
+    "type": "library",
+    "keywords": [
+        "pdf",
+        "stream",
+        "memory-efficient",
+        "php8.3",
+        "report",
+        "invoice"
+    ],
+    "homepage": "https://mejiropdf.com",
+    "license": "AGPL-3.0-or-later",
+    "authors": [
+        {
+            "name": "Yusuke Tsubonoue",
+            "email": "support@2bo-velocity.com",
+            "homepage": "https://github.com/2bo-velocity"
+        }
+    ],
+    "require": {
+        "php": ">=8.3",
+        "ext-mbstring": "*",
+        "psr/log": "^3.0"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^10.5",
+        "phpstan/phpstan": "^1.11"
+    },
+    "autoload": {
+        "psr-4": {
+            "MejiroPDF\\": "src/"
+        },
+        "files": [
+            "src/bootstrap.php"
+        ]
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "MejiroPDF\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit",
+        "stan": "phpstan analyse --level=8 src"
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "stable"
+}

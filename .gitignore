@@ -1,0 +1,10 @@
+/vendor/
+/composer.lock
+/.phpunit.cache/
+/.phpstan.cache/
+# Only the examples' output. A blanket *.pdf also swallowed the hand-made
+# import fixtures under tests/fixtures/pdf/, which are source, not artefacts —
+# and since release-engine.sh feeds this file to rsync as the publish manifest,
+# anything ignored here never reaches the public repository at all.
+/examples/*.pdf
+/examples/*.mpb

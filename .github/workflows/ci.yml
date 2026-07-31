@@ -1,0 +1,79 @@
+name: CI
+
+# The public repository's own checks.
+#
+# This file is a mirror artefact: it lives in the development monorepo under
+# apps/mejiropdf/.github/ and is copied out by scripts/release-engine.sh. Edit it
+# there, never in the public repository — the next sync would overwrite it.
+#
+# It deliberately repeats what the monorepo's own CI already runs. The point is
+# not extra coverage but visibility: the published repository states that pull
+# requests are not accepted, so its checks are the only evidence a reader has
+# that the source they are about to depend on actually passes anything. A README
+# claim nobody can verify is worth less than a green run they can click into.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: PHP ${{ matrix.php }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 8.3 is the floor the engine declares and enforces at runtime; 8.4 is
+        # what most people will actually run it on.
+        php: ['8.3', '8.4']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: mbstring, iconv, zlib
+          coverage: none
+          tools: composer:v2
+
+      # The TrueType embedding tests need a real font file. They skip cleanly
+      # when none is present, which would quietly hollow out the suite — so one
+      # is installed rather than relying on whatever the image happens to ship.
+      - name: Install a TrueType test font
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends fonts-dejavu-core
+
+      - name: Cache Composer packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/composer
+          key: composer-${{ runner.os }}-php${{ matrix.php }}-${{ hashFiles('composer.json') }}
+          restore-keys: composer-${{ runner.os }}-php${{ matrix.php }}-
+
+      # `update`, not `install`: a library ships no composer.lock, so this also
+      # tells us when a dependency's newest release breaks the build — which is
+      # the version a fresh `composer require` would resolve to.
+      - name: Install dependencies
+        run: composer update --prefer-dist --no-progress --no-interaction
+
+      # Not --strict: it rejects unbound constraints such as "php": ">=8.3",
+      # which is the constraint this library actually means. What is worth
+      # failing on is a composer.json Packagist would refuse.
+      - name: Validate composer.json
+        run: composer validate --no-check-lock
+
+      # The limit is stated rather than inherited: PHPStan's parallel workers
+      # die with an incomplete result — not a clean failure — when they hit a
+      # default 128M, and which default applies depends on the runner image.
+      - name: PHPStan (level 8)
+        run: vendor/bin/phpstan analyse --no-progress --memory-limit=1G
+
+      - name: PHPUnit
+        run: vendor/bin/phpunit
