@@ -203,8 +203,35 @@ $pdf->importPage('logo.pdf', 1, x: 150, y: 12, width: 40); // positioned
 The source page becomes a Form XObject (its resources are copied and remapped).
 Handles classic xref, cross-reference / object streams with PNG predictors
 (PDF 1.5+), **hybrid-reference** files (classic table + `/XRefStm`), and
-`/Resources` inherited from an ancestor `/Pages` node. Encrypted sources raise a
+`/Resources` and `/Rotate` inherited from an ancestor `/Pages` node. A source
+that stores a landscape page as a portrait box plus `/Rotate 90` — what scanners
+and office suites usually write — arrives the way a viewer shows it, so the
+millimetres you stamp in are the ones you measured. Encrypted sources raise a
 clear error. See [`examples/import_background.php`](examples/import_background.php).
+
+### Rotation
+
+Three scopes, depending on what should turn.
+
+```php
+// One element, about the centre of its own box.
+$pdf->image('photo.jpg', x: 20, y: 60, width: 80, rotation: 45);
+
+// A whole group, as one piece — the parts keep their spacing.
+$pdf->rotated(-90.0, x: 25, y: 60, draw: function (Document $pdf): void {
+    $pdf->rect(25, 60, 180, 22, fill: '#1a3a7a');
+    $pdf->text(31, 72, 'Bound edge', color: '#FFFFFF');
+});
+
+// The sheet itself: /Rotate, so a viewer and a printer present it turned.
+$pdf->addPage(PageSize::a4(Orientation::LANDSCAPE), rotation: 90);
+```
+
+Inside `rotated()` you write the coordinates you would have used unturned, and
+groups nest. It refuses to open a page (a break would split the transform across
+two content streams), and `strictCanvas` checks only the pivot, since a turned
+frame's page coordinates no longer say where the marks land. See
+[`examples/rotation.php`](examples/rotation.php).
 
 ### Logging
 

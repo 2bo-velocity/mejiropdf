@@ -22,6 +22,11 @@ namespace MejiroPDF\Import;
  * Indirect references inside {@see $resources} and {@see $objects} still use the
  * *source* PDF's object numbers; the importer remaps them when copying into the
  * destination document.
+ *
+ * {@see $bbox} is the page's MediaBox as written, *before* {@see $rotate} is
+ * applied: the two together describe the page, and it is the embedder's job to
+ * turn it. Keeping them apart means the Form XObject can be copied through
+ * byte-for-byte and the quarter turn expressed as a matrix at placement time.
  */
 final readonly class ImportedPage
 {
@@ -30,12 +35,14 @@ final readonly class ImportedPage
      * @param string                                              $content   Decompressed page content operators.
      * @param string                                              $resources The page /Resources dictionary.
      * @param array<int, array{dict: string, stream: string|null}> $objects  Reachable objects, by source object number.
+     * @param int                                                 $rotate    Clockwise display rotation: 0, 90, 180 or 270.
      */
     public function __construct(
         public string $bbox,
         public string $content,
         public string $resources,
         public array $objects,
+        public int $rotate = 0,
     ) {
     }
 }

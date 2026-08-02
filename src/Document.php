@@ -169,6 +169,13 @@ final class Document
     private ?PageNumberOptions $pageNumbers = null;
 
     private ?PageSize $currentSize = null;
+
+    /** The open page's /Rotate, in degrees clockwise: 0, 90, 180 or 270. */
+    private int $pageRotation = 0;
+
+    /** How many {@see rotated} groups are open around the drawing calls. */
+    private int $rotationDepth = 0;
+
     private string $content = '';
     private bool $pageOpen = false;
     private bool $finalized = false;
@@ -359,9 +366,33 @@ final class Document
         return $this;
     }
 
-    public function addPage(?PageSize $size = null): self
+    /**
+     * Open a new page, optionally of a different size and turned for display.
+     *
+     * $rotation is written to the page's /Rotate: an instruction to the viewer
+     * and the printer to turn the finished sheet clockwise by that many degrees.
+     * It is how a document made of portrait sheets carries one wide page — laid
+     * out landscape, presented turned — without the reader's page width jumping
+     * about. It does **not** move the drawing origin: every coordinate below is
+     * still measured on the untuned sheet, exactly as on any other page. To turn
+     * the marks rather than the paper, use {@see rotated}.
+     *
+     * Must be a multiple of 90; other values are refused rather than rounded,
+     * because a viewer would ignore them and the page would silently come out
+     * upright.
+     */
+    public function addPage(?PageSize $size = null, int $rotation = 0): self
     {
         $this->assertNotFinalized();
+
+        if ($rotation % 90 !== 0) {
+            throw new \InvalidArgumentException(
+                \sprintf('Page rotation must be a multiple of 90 degrees; %d given.', $rotation),
+            );
+        }
+        if ($this->rotationDepth > 0) {
+            throw new \LogicException('A page cannot be opened inside rotated(); close the group first.');
+        }
 
         // Counted before the page opens, so the limit is the number of pages
         // that exist rather than the number that were attempted.
@@ -372,6 +403,7 @@ final class Document
         $this->commitPage();
 
         $this->currentSize = $size ?? $this->defaultSize;
+        $this->pageRotation = ($rotation % 360 + 360) % 360;
         $this->content = '';
         $this->pageOpen = true;
 
@@ -706,9 +738,7 @@ final class Document
             Anchor::CENTER => [$widthPt / 2.0, -$heightPt / 2.0],
         };
 
-        $rad = \deg2rad($rotation);
-        $cos = \cos($rad);
-        $sin = \sin($rad);
+        [$cos, $sin] = self::rotationCosSin($rotation);
         $targetX = PageSize::mm($x);
         $targetY = $this->pageHeightPt() - PageSize::mm($y);
 
@@ -729,6 +759,114 @@ final class Document
             . "Q\n";
 
         return $this;
+    }
+
+    /**
+     * Draw a group of elements turned as one: everything $draw emits is rotated
+     * $degrees counter-clockwise about the pivot (x, y) in millimetres.
+     *
+     * ```php
+     * $pdf->rotated(90.0, x: 20, y: 250, function (Document $pdf): void {
+     *     $pdf->drawBox($box, 0, 0, 180);
+     *     $pdf->grid($columns, 0, 40)->row(['…'])->close();
+     * });
+     * ```
+     *
+     * This exists because what people want turned is rarely a lone element: it
+     * is a label, an obi band, a sideways table — a frame, its rules and its
+     * text, which have to keep their positions relative to each other. Passing
+     * an angle to each of them separately cannot do that, since each would turn
+     * about its own centre and the assembly would come apart.
+     *
+     * Inside the group, coordinates are the ones you would have used unturned,
+     * measured from the same page origin; the rotation is applied on the way
+     * out. Groups nest, and the angles add up.
+     *
+     * Three things follow from the fact that this is one PDF transform:
+     *
+     * - `strictCanvas` stands down inside the group. Only the pivot is checked,
+     *   on the way in; a turned frame's page coordinates no longer describe
+     *   where the marks land, so the check has nothing true to say about them.
+     * - Opening a page inside the group is refused. A page break would split the
+     *   transform across two content streams and leave the first unbalanced.
+     * - Link annotations do not turn. PDF fixes an annotation's /Rect to the
+     *   page axes, so a link added here stays an upright rectangle over turned
+     *   text. The document says so once, in a warning on the logger.
+     */
+    public function rotated(float $degrees, float $x, float $y, callable $draw): self
+    {
+        $this->ensurePage();
+
+        // The pivot is the one point that has to be on the sheet; what the group
+        // then swings over the edge is the whole point of turning it.
+        $this->assertOnCanvas('Rotated group pivot', $x, $y, 0.0, 0.0);
+
+        $this->content .= self::rotationOps(
+            $degrees,
+            PageSize::mm($x),
+            $this->pageHeightPt() - PageSize::mm($y),
+        );
+        $this->rotationDepth++;
+
+        try {
+            $draw($this);
+        } finally {
+            // Closed even when $draw throws: an unbalanced `q` would leave every
+            // later mark on the page turned, so a caller that catches the
+            // exception and carries on must still get an upright page.
+            $this->rotationDepth--;
+            $this->content .= "Q\n";
+        }
+
+        return $this;
+    }
+
+    /**
+     * `q` plus the `cm` that turns everything up to the matching `Q` by
+     * $degrees counter-clockwise about the point (cx, cy) in PDF points.
+     *
+     * Useful on anything that already emits a balanced, self-positioning run of
+     * operators — {@see image} and the template painter's fields both place
+     * themselves and are then simply turned.
+     */
+    private static function rotationOps(float $degrees, float $cxPt, float $cyPt): string
+    {
+        [$cos, $sin] = self::rotationCosSin($degrees);
+
+        return \sprintf(
+            "q\n%.5F %.5F %.5F %.5F %.2F %.2F cm\n",
+            $cos,
+            $sin,
+            -$sin,
+            $cos,
+            $cxPt - ($cxPt * $cos - $cyPt * $sin),
+            $cyPt - ($cxPt * $sin + $cyPt * $cos),
+        );
+    }
+
+    /**
+     * Cosine and sine of $degrees, with the quarter turns returned exactly.
+     *
+     * Those four angles are most of what anyone asks for, and deg2rad() leaves
+     * a 1e-17 behind on each of them; giving back a clean 0 and 1 keeps the
+     * matrices readable and the arithmetic that builds on them exact.
+     *
+     * @return array{0: float, 1: float}
+     */
+    private static function rotationCosSin(float $degrees): array
+    {
+        $turn = \fmod($degrees, 360.0);
+        if ($turn < 0.0) {
+            $turn += 360.0;
+        }
+
+        return match ($turn) {
+            0.0 => [1.0, 0.0],
+            90.0 => [0.0, 1.0],
+            180.0 => [-1.0, 0.0],
+            270.0 => [0.0, -1.0],
+            default => [\cos(\deg2rad($degrees)), \sin(\deg2rad($degrees))],
+        };
     }
 
     /**
@@ -784,7 +922,11 @@ final class Document
      */
     private function assertOnCanvas(string $what, float $x, float $y, float $width, float $height): void
     {
-        if (!$this->strictCanvas) {
+        // Inside a rotated() group the coordinates are local to a turned frame,
+        // so comparing them against the page box would reject work that lands
+        // perfectly well and pass work that does not. The pivot was checked when
+        // the group opened; that is the honest part of the question.
+        if (!$this->strictCanvas || $this->rotationDepth > 0) {
             return;
         }
 
@@ -1336,6 +1478,10 @@ final class Document
      * height is given the other is derived from the image's aspect ratio; if
      * neither is given a 40 mm width is assumed. The same image instance reused
      * across pages is embedded only once.
+     *
+     * $rotation turns the image counter-clockwise, in degrees, about the centre
+     * of the box it was given — the same pivot {@see textObject} uses, so a
+     * caption set at the same angle stays parallel to the picture.
      */
     public function image(
         RasterImage|string $image,
@@ -1343,6 +1489,7 @@ final class Document
         float $y,
         ?float $width = null,
         ?float $height = null,
+        float $rotation = 0.0,
     ): self {
         $this->ensurePage();
 
@@ -1372,9 +1519,28 @@ final class Document
         $px = PageSize::mm($x);
         $py = $this->pageHeightPt() - PageSize::mm($y) - $displayH;
 
-        $this->assertOnCanvas('Image', $x, $y, $width, $height);
+        $rotated = $rotation !== 0.0;
+        if ($rotated) {
+            // Only the pivot is checked when the image turns: a rotated picture
+            // is free to swing its corners off the sheet — the same latitude
+            // {@see textObject} gives a diagonal watermark — but the point it
+            // was placed on has to be on the page.
+            $this->assertOnCanvas('Image', $x + $width / 2.0, $y + $height / 2.0, 0.0, 0.0);
+            $this->content .= self::rotationOps($rotation, $px + $displayW / 2.0, $py + $displayH / 2.0);
+        } else {
+            $this->assertOnCanvas('Image', $x, $y, $width, $height);
+        }
+
+        // The placement below is a self-contained `q … Do Q`, so wrapping it in
+        // a rotation is all turning it takes. The debug frame rides inside that
+        // wrapper and therefore turns with the picture instead of boxing it in
+        // page space.
         $this->content .= \sprintf("q\n%.2F 0 0 %.2F %.2F %.2F cm\n/%s Do\nQ\n", $displayW, $displayH, $px, $py, $name);
         $this->debugGuide($x, $y, $width, $height, self::GUIDE_IMAGE);
+
+        if ($rotated) {
+            $this->content .= "Q\n";
+        }
 
         return $this;
     }
@@ -1384,25 +1550,21 @@ final class Document
      * current page, as a vector background. Call this before drawing foreground
      * content so it sits behind everything.
      *
+     * The source's /Rotate is honoured, so the page arrives the way its author
+     * meant it to be read rather than on its side.
+     *
      * Scope: classic-xref (PDF ≤ 1.4), unencrypted sources; cross-reference
      * streams (PDF 1.5+) and encrypted sources raise a PdfImportException.
      */
     public function importPageAsBackground(string $path, int $pageNumber = 1): self
     {
-        [$name, $x0, $y0, $x1, $y1] = $this->embedImportedPage($path, $pageNumber);
+        [$name, $importedW, $importedH, $matrix] = $this->embedImportedPage($path, $pageNumber);
 
-        // Scale the imported BBox to fill the current page.
+        // Scale the imported page to fill the current one.
         $size = $this->currentSize ?? $this->defaultSize;
-        $scaleX = ($x1 - $x0) != 0.0 ? $size->width / ($x1 - $x0) : 1.0;
-        $scaleY = ($y1 - $y0) != 0.0 ? $size->height / ($y1 - $y0) : 1.0;
-        $this->content .= \sprintf(
-            "q\n%.4F 0 0 %.4F %.4F %.4F cm\n/%s Do\nQ\n",
-            $scaleX,
-            $scaleY,
-            -$x0 * $scaleX,
-            -$y0 * $scaleY,
-            $name,
-        );
+        $scaleX = $importedW != 0.0 ? $size->width / $importedW : 1.0;
+        $scaleY = $importedH != 0.0 ? $size->height / $importedH : 1.0;
+        $this->content .= self::placeImported($matrix, $scaleX, $scaleY, 0.0, 0.0, $name);
 
         return $this;
     }
@@ -1412,6 +1574,9 @@ final class Document
      * corner at (x, y) millimetres. If only one of width/height is given the
      * other follows the imported aspect ratio; if neither, the page is placed at
      * its native size (1 pt = 1 pt).
+     *
+     * "Native size" and "aspect ratio" mean the page as displayed, so a source
+     * carrying /Rotate 90 is measured — and placed — landscape.
      */
     public function importPage(
         string $path,
@@ -1421,10 +1586,10 @@ final class Document
         ?float $width = null,
         ?float $height = null,
     ): self {
-        [$name, $x0, $y0, $x1, $y1] = $this->embedImportedPage($path, $pageNumber);
+        [$name, $importedW, $importedH, $matrix] = $this->embedImportedPage($path, $pageNumber);
 
-        $nativeW = ($x1 - $x0) / PageSize::MM_TO_PT;
-        $nativeH = ($y1 - $y0) / PageSize::MM_TO_PT;
+        $nativeW = $importedW / PageSize::MM_TO_PT;
+        $nativeH = $importedH / PageSize::MM_TO_PT;
         $aspect = $nativeW != 0.0 ? $nativeH / $nativeW : 1.0;
 
         if ($width === null && $height === null) {
@@ -1436,20 +1601,13 @@ final class Document
             $height = $width * $aspect;
         }
 
-        // Map the imported BBox onto the target rectangle (top-left origin, mm).
-        $scaleX = ($x1 - $x0) != 0.0 ? PageSize::mm($width) / ($x1 - $x0) : 1.0;
-        $scaleY = ($y1 - $y0) != 0.0 ? PageSize::mm($height) / ($y1 - $y0) : 1.0;
-        $tx = PageSize::mm($x) - $x0 * $scaleX;
-        $ty = ($this->pageHeightPt() - PageSize::mm($y + $height)) - $y0 * $scaleY;
+        // Map the displayed page onto the target rectangle (top-left origin, mm).
+        $scaleX = $importedW != 0.0 ? PageSize::mm($width) / $importedW : 1.0;
+        $scaleY = $importedH != 0.0 ? PageSize::mm($height) / $importedH : 1.0;
+        $tx = PageSize::mm($x);
+        $ty = $this->pageHeightPt() - PageSize::mm($y + $height);
 
-        $this->content .= \sprintf(
-            "q\n%.4F 0 0 %.4F %.4F %.4F cm\n/%s Do\nQ\n",
-            $scaleX,
-            $scaleY,
-            $tx,
-            $ty,
-            $name,
-        );
+        $this->content .= self::placeImported($matrix, $scaleX, $scaleY, $tx, $ty, $name);
 
         return $this;
     }
@@ -1465,6 +1623,11 @@ final class Document
      * it never rewrites the original operators. Loop over {@see importedPageCount}
      * to stamp every page of a multi-page template.
      *
+     * The new page takes the source's *displayed* size, so a scan stored as a
+     * portrait MediaBox plus /Rotate 90 opens landscape with its content the
+     * right way up — and the millimetres a caller then stamps in are the ones
+     * they measured off the screen.
+     *
      * Same source scope as {@see importPage}: classic-xref or cross-reference
      * stream (PDF 1.5+), unencrypted.
      */
@@ -1472,13 +1635,12 @@ final class Document
     {
         $this->assertNotFinalized();
         $imported = PdfPageImporter::import($this->readSource($path), $pageNumber);
-        [$x0, $y0, $x1, $y1] = $this->parseBox($imported->bbox);
+        [$displayW, $displayH, $matrix] = $this->displayedPage($imported);
 
-        $this->addPage(new PageSize(\max(1.0, $x1 - $x0), \max(1.0, $y1 - $y0)));
+        $this->addPage(new PageSize(\max(1.0, $displayW), \max(1.0, $displayH)));
 
         $name = $this->embedImported($imported);
-        // Origin-align the source box (its MediaBox need not start at 0 0).
-        $this->content .= \sprintf("q\n1 0 0 1 %.4F %.4F cm\n/%s Do\nQ\n", -$x0, -$y0, $name);
+        $this->content .= self::placeImported($matrix, 1.0, 1.0, 0.0, 0.0, $name);
 
         return $this;
     }
@@ -1493,10 +1655,11 @@ final class Document
     }
 
     /**
-     * Read, import and embed a PDF page as a Form XObject, returning its
-     * resource name and BBox corners (points).
+     * Read, import and embed a PDF page as a Form XObject.
      *
-     * @return array{0: string, 1: float, 2: float, 3: float, 4: float}
+     * @return array{0: string, 1: float, 2: float, 3: array{float, float, float, float, float, float}}
+     *         resource name, displayed width and height (points), and the
+     *         matrix described by {@see displayedPage}
      */
     private function embedImportedPage(string $path, int $pageNumber): array
     {
@@ -1504,9 +1667,65 @@ final class Document
 
         $imported = PdfPageImporter::import($this->readSource($path), $pageNumber);
         $name = $this->embedImported($imported);
-        [$x0, $y0, $x1, $y1] = $this->parseBox($imported->bbox);
+        [$width, $height, $matrix] = $this->displayedPage($imported);
 
-        return [$name, $x0, $y0, $x1, $y1];
+        return [$name, $width, $height, $matrix];
+    }
+
+    /**
+     * An imported page as a viewer shows it: its size in points, and the matrix
+     * carrying source page coordinates onto [0, width] x [0, height].
+     *
+     * Two corrections are folded in. A MediaBox need not start at 0 0, so the
+     * origin moves to its lower-left corner; and /Rotate — which a viewer
+     * applies before showing anything, and which scanners and office suites
+     * write far more often than a landscape MediaBox — becomes a quarter turn,
+     * swapping width and height at 90 and 270.
+     *
+     * Expressing the turn here rather than in the Form XObject keeps the
+     * imported page byte-identical to its source, which is the whole promise of
+     * the non-destructive overlay model.
+     *
+     * @return array{0: float, 1: float, 2: array{float, float, float, float, float, float}}
+     */
+    private function displayedPage(ImportedPage $page): array
+    {
+        [$x0, $y0, $x1, $y1] = $this->parseBox($page->bbox);
+        $width = $x1 - $x0;
+        $height = $y1 - $y0;
+
+        return match ($page->rotate) {
+            90 => [$height, $width, [0.0, -1.0, 1.0, 0.0, -$y0, $x1]],
+            180 => [$width, $height, [-1.0, 0.0, 0.0, -1.0, $x1, $y1]],
+            270 => [$height, $width, [0.0, 1.0, -1.0, 0.0, $y1, -$x0]],
+            default => [$width, $height, [1.0, 0.0, 0.0, 1.0, -$x0, -$y0]],
+        };
+    }
+
+    /**
+     * Paint an imported page, concatenating a scale and translation onto its
+     * display matrix so the whole placement stays a single `cm`.
+     *
+     * @param array{float, float, float, float, float, float} $m
+     */
+    private static function placeImported(
+        array $m,
+        float $scaleX,
+        float $scaleY,
+        float $x,
+        float $y,
+        string $name,
+    ): string {
+        return \sprintf(
+            "q\n%.4F %.4F %.4F %.4F %.4F %.4F cm\n/%s Do\nQ\n",
+            $m[0] * $scaleX,
+            $m[1] * $scaleY,
+            $m[2] * $scaleX,
+            $m[3] * $scaleY,
+            $m[4] * $scaleX + $x,
+            $m[5] * $scaleY + $y,
+            $name,
+        );
     }
 
     private function readSource(string $path): string
@@ -1552,9 +1771,13 @@ final class Document
 
     /**
      * Add a clickable web link over the rectangle at (x, y) millimetres.
+     *
+     * The area is always axis-aligned: see {@see rotated} for what that means
+     * inside a turned group.
      */
     public function link(float $x, float $y, float $width, float $height, string $url): self
     {
+        $this->warnAboutRotatedLink($x, $y);
         $this->pendingAnnots[] = [
             'kind' => 'uri',
             'rect' => $this->annotRect($x, $y, $width, $height),
@@ -1571,6 +1794,7 @@ final class Document
      */
     public function linkToPage(float $x, float $y, float $width, float $height, int $pageNumber): self
     {
+        $this->warnAboutRotatedLink($x, $y);
         $this->pendingAnnots[] = [
             'kind' => 'goto',
             'rect' => $this->annotRect($x, $y, $width, $height),
@@ -1579,6 +1803,28 @@ final class Document
         ];
 
         return $this;
+    }
+
+    /**
+     * Say once, per link, that a clickable area placed inside {@see rotated}
+     * will not turn with the group.
+     *
+     * PDF pins an annotation's /Rect to the page axes, so there is nothing to
+     * fix here — but the mismatch between where the text ends up and where the
+     * click works is invisible until someone tries it, which is exactly the kind
+     * of thing a log line is for. It stays proportional to the number of links,
+     * not to the size of the document.
+     */
+    private function warnAboutRotatedLink(float $x, float $y): void
+    {
+        if ($this->rotationDepth === 0) {
+            return;
+        }
+
+        $this->logger->warning(
+            'Link area added inside rotated(); PDF annotations are axis-aligned and will not turn with the group',
+            ['x' => $x, 'y' => $y, 'page' => $this->pageCount()],
+        );
     }
 
     /**
@@ -1847,12 +2093,17 @@ final class Document
         }
         $annotsRef = $ids === [] ? '' : ' /Annots [ ' . \implode(' ', $ids) . ' ]';
 
+        // Omitted when upright, so pages that do not ask to be turned are
+        // byte-for-byte what they always were.
+        $rotate = $this->pageRotation !== 0 ? \sprintf(' /Rotate %d', $this->pageRotation) : '';
+
         $pageId = $this->doc->allocateObjectId();
         $this->doc->writeObject($pageId, \sprintf(
-            '<< /Type /Page /Parent %d 0 R /MediaBox [0 0 %.2F %.2F] /Contents [ %d 0 R %d 0 R ]%s >>',
+            '<< /Type /Page /Parent %d 0 R /MediaBox [0 0 %.2F %.2F]%s /Contents [ %d 0 R %d 0 R ]%s >>',
             $this->pagesId,
             $size->width,
             $size->height,
+            $rotate,
             $contentId,
             $footerId,
             $annotsRef,
@@ -1860,6 +2111,7 @@ final class Document
 
         $this->pages[] = ['page' => $pageId, 'footer' => $footerId, 'size' => $size, 'annots' => $annots];
         $this->pageOpen = false;
+        $this->pageRotation = 0;
         $this->content = '';
     }
 

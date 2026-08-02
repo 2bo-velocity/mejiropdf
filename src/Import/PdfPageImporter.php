@@ -75,7 +75,7 @@ final class PdfPageImporter
 
         return \array_map(
             static fn (array $page): string => $page[1],
-            $this->collectPages($pagesRef, '0 0 612 792', null, 0),
+            $this->collectPages($pagesRef, '0 0 612 792', null, 0, 0),
         );
     }
 
@@ -91,13 +91,13 @@ final class PdfPageImporter
         $pagesRef = $this->firstRef($catalog, 'Pages')
             ?? throw PdfImportException::invalid('Catalog has no /Pages.');
 
-        $pages = $this->collectPages($pagesRef, '0 0 612 792', null, 0);
+        $pages = $this->collectPages($pagesRef, '0 0 612 792', null, 0, 0);
         if ($pageNumber < 1 || $pageNumber > \count($pages)) {
             throw PdfImportException::invalid(
                 \sprintf('Page %d is out of range (document has %d page(s)).', $pageNumber, \count($pages)),
             );
         }
-        [$pageDict, $bbox, $resourcesValue] = $pages[$pageNumber - 1];
+        [$pageDict, $bbox, $resourcesValue, $rotate] = $pages[$pageNumber - 1];
         $resources = $this->resolveResources($resourcesValue);
 
         return new ImportedPage(
@@ -105,6 +105,7 @@ final class PdfPageImporter
             content: $this->pageContent($pageDict),
             resources: $resources,
             objects: $this->collectObjects($resources),
+            rotate: $rotate,
         );
     }
 
@@ -373,23 +374,32 @@ final class PdfPageImporter
 
     /**
      * @param  string|null $inheritedResources raw /Resources value inherited from an ancestor node
-     * @return list<array{string, string, string|null}> [pageDict, mediaBox, resourcesValue]
+     * @param  int         $inheritedRotate    /Rotate inherited from an ancestor node
+     * @return list<array{string, string, string|null, int}> [pageDict, mediaBox, resourcesValue, rotate]
      */
-    private function collectPages(int $node, string $inheritedBox, ?string $inheritedResources, int $depth): array
-    {
+    private function collectPages(
+        int $node,
+        string $inheritedBox,
+        ?string $inheritedResources,
+        int $inheritedRotate,
+        int $depth,
+    ): array {
         if ($depth > 50) {
             throw PdfImportException::invalid('Page tree nesting too deep.');
         }
         [$dict] = $this->object($node);
         $box = $this->mediaBox($dict) ?? $inheritedBox;
-        // /Resources is an inheritable attribute (PDF 32000-1 §7.7.3.4).
+        // /Resources and /Rotate are both inheritable attributes (PDF 32000-1
+        // §7.7.3.4): a producer may set the rotation once on the page tree root
+        // and leave every page silent about it.
         $resources = $this->rawValue($dict, 'Resources') ?? $inheritedResources;
+        $rotate = $this->rotate($dict) ?? $inheritedRotate;
 
         if (\preg_match('#/Type\s*/Pages\b#', $dict) === 1 || \preg_match('#/Kids\b#', $dict) === 1) {
             $pages = [];
             \preg_match_all('/(\d+)\s+\d+\s+R/', $this->arrayValue($dict, 'Kids'), $kids);
             foreach ($kids[1] as $kid) {
-                foreach ($this->collectPages((int) $kid, $box, $resources, $depth + 1) as $page) {
+                foreach ($this->collectPages((int) $kid, $box, $resources, $rotate, $depth + 1) as $page) {
                     $pages[] = $page;
                 }
             }
@@ -397,7 +407,7 @@ final class PdfPageImporter
             return $pages;
         }
 
-        return [[$dict, $box, $resources]];
+        return [[$dict, $box, $resources, $rotate]];
     }
 
     private function pageContent(string $pageDict): string
@@ -477,6 +487,28 @@ final class PdfPageImporter
     private function mediaBox(string $dict): ?string
     {
         return \preg_match('/\/MediaBox\s*\[([^\]]+)\]/', $dict, $m) === 1 ? \trim($m[1]) : null;
+    }
+
+    /**
+     * The node's own /Rotate, normalised to 0, 90, 180 or 270, or null when it
+     * does not carry one and should inherit.
+     *
+     * Scanners and office suites routinely write a portrait MediaBox plus
+     * /Rotate 90 rather than a landscape box, and negative values are just as
+     * common as positive ones, so both have to survive the trip.
+     */
+    private function rotate(string $dict): ?int
+    {
+        if (\preg_match('/\/Rotate\s+(-?\d+)/', $dict, $m) !== 1) {
+            return null;
+        }
+
+        $degrees = ((int) $m[1] % 360 + 360) % 360;
+
+        // The spec admits only multiples of 90. Anything else is a broken
+        // producer, and turning the page by a guess would lose more than
+        // leaving it as written.
+        return $degrees % 90 === 0 ? $degrees : 0;
     }
 
     private function firstRef(string $dict, string $key): ?int

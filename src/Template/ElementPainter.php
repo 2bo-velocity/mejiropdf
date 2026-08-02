@@ -226,20 +226,10 @@ final class ElementPainter
         $left = $image->x + $dx + ($image->width - $drawWidth) / 2.0;
         $top = $image->y + $dy + ($image->height - $drawHeight) / 2.0;
 
-        // Document::image() emits its own self-contained `q … Do Q`, so
-        // wrapping the call in a rotation matrix is enough to turn it.
-        $rotated = $image->rotation !== 0.0;
-        if ($rotated) {
-            $document->appendContentOps($this->rotationOps(
-                $image->rotation,
-                PageSize::mm($image->x + $dx + $image->width / 2.0),
-                PageSize::mm($document->pageHeightMm() - ($image->y + $dy + $image->height / 2.0)),
-            ));
-        }
-        $document->image($raster, $left, $top, $drawWidth, $drawHeight);
-        if ($rotated) {
-            $document->appendContentOps("Q\n");
-        }
+        // The drawn image is centred in its element box whatever the fit, so the
+        // box centre the designer rotated about is the centre Document::image()
+        // turns about.
+        $document->image($raster, $left, $top, $drawWidth, $drawHeight, $image->rotation);
     }
 
     /**
@@ -289,24 +279,6 @@ final class ElementPainter
         }
 
         return $byWidth[1] <= $image->height ? $byWidth : $byHeight;
-    }
-
-    /** `q` plus the `cm` rotating $degrees counter-clockwise about a point. */
-    private function rotationOps(float $degrees, float $cxPt, float $cyPt): string
-    {
-        $rad = \deg2rad($degrees);
-        $cos = \cos($rad);
-        $sin = \sin($rad);
-
-        return \sprintf(
-            "q\n%.5F %.5F %.5F %.5F %.2F %.2F cm\n",
-            $cos,
-            $sin,
-            -$sin,
-            $cos,
-            $cxPt - ($cxPt * $cos - $cyPt * $sin),
-            $cyPt - ($cxPt * $sin + $cyPt * $cos),
-        );
     }
 
     private static function textAlign(Alignment $align): TextAlign

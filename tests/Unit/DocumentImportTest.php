@@ -81,8 +81,9 @@ final class DocumentImportTest extends TestCase
 
         self::assertStringContainsString('/Subtype /Form', $out);
         self::assertMatchesRegularExpression('~/Im0 Do~', $out);
-        // A cm matrix positions/scales the imported form.
-        self::assertMatchesRegularExpression('~q\n[\d.]+ 0 0 [\d.]+ [\d.]+ [\d.]+ cm~', $out);
+        // A cm matrix positions/scales the imported form; an unrotated source
+        // leaves the off-diagonal terms at zero.
+        self::assertMatchesRegularExpression('~q\n[\d.]+ 0\.0000 0\.0000 [\d.]+ [\d.]+ [\d.]+ cm~', $out);
     }
 
     #[Test]
@@ -97,13 +98,88 @@ final class DocumentImportTest extends TestCase
         // The source page is embedded as a form and painted 1:1 (identity CTM).
         self::assertStringContainsString('/Subtype /Form', $out);
         self::assertStringContainsString('/BBox [ 0 0 595 842 ]', $out);
-        // Painted 1:1 with an identity scale (translation is the -MediaBox origin).
-        self::assertMatchesRegularExpression('~q\n1 0 0 1 -?0\.0000 -?0\.0000 cm\n/Im0 Do\nQ~', $out);
+        // Painted 1:1 with an identity matrix (the translation is the -MediaBox origin).
+        self::assertMatchesRegularExpression(
+            '~q\n1\.0000 0\.0000 0\.0000 1\.0000 -?0\.0000 -?0\.0000 cm\n/Im0 Do\nQ~',
+            $out,
+        );
         // The new page adopts the source page's MediaBox (595 x 842 pt).
         self::assertStringContainsString('/MediaBox [0 0 595.00 842.00]', $out);
         // The imported vector op and the overlaid text both survive.
         self::assertStringContainsString('re f', $out);
         self::assertStringContainsString('(Filled field) Tj', $out);
+    }
+
+    #[Test]
+    public function editing_a_rotated_template_opens_the_page_as_it_is_displayed(): void
+    {
+        // The source is a portrait MediaBox (595 x 842) carrying /Rotate 90 —
+        // how scanners and office suites usually store a landscape page.
+        $pdf = new Document(credit: CreditOptions::disabled());
+        $pdf->editTemplatePage($this->fixture('rotated.pdf'), 2);
+
+        $out = $pdf->output();
+
+        // The new page is landscape: width and height have swapped.
+        self::assertStringContainsString('/MediaBox [0 0 842.00 595.00]', $out);
+        // The imported form is turned a quarter of a turn to match.
+        self::assertStringContainsString("0.0000 -1.0000 1.0000 0.0000 0.0000 595.0000 cm\n/Im0 Do", $out);
+        // The BBox is still the source's own box: the turn is in the matrix.
+        self::assertStringContainsString('/BBox [ 0 0 595 842 ]', $out);
+    }
+
+    #[Test]
+    public function an_inherited_rotation_turns_the_page_the_other_way(): void
+    {
+        // Page 1 has no /Rotate of its own and inherits 270 from /Pages.
+        $pdf = new Document(credit: CreditOptions::disabled());
+        $pdf->editTemplatePage($this->fixture('rotated.pdf'), 1);
+
+        $out = $pdf->output();
+
+        self::assertStringContainsString('/MediaBox [0 0 842.00 595.00]', $out);
+        self::assertStringContainsString("0.0000 1.0000 -1.0000 0.0000 842.0000 0.0000 cm\n/Im0 Do", $out);
+    }
+
+    #[Test]
+    public function a_rotation_that_is_not_a_quarter_turn_leaves_the_page_alone(): void
+    {
+        // Page 4 says /Rotate 45, which the spec does not allow.
+        $pdf = new Document(credit: CreditOptions::disabled());
+        $pdf->editTemplatePage($this->fixture('rotated.pdf'), 4);
+
+        $out = $pdf->output();
+
+        self::assertStringContainsString('/MediaBox [0 0 595.00 842.00]', $out);
+        self::assertStringContainsString("1.0000 0.0000 0.0000 1.0000 0.0000 0.0000 cm\n/Im0 Do", $out);
+    }
+
+    #[Test]
+    public function a_rotated_source_is_measured_landscape_when_placed(): void
+    {
+        // Asked for a 100 mm width, the height must follow the *displayed*
+        // aspect (842:595), not the MediaBox's (595:842).
+        $pdf = new Document(credit: CreditOptions::disabled());
+        $pdf->addPage()->importPage($this->fixture('rotated.pdf'), 2, x: 10, y: 10, width: 100.0);
+
+        $out = $pdf->output();
+
+        // 100 mm wide over a 842 pt box scales by 283.46/842 = 0.3367; the
+        // quarter turn puts that factor on the off-diagonal.
+        self::assertMatchesRegularExpression('~q\n0\.0000 -0\.336\d+ 0\.336\d+ 0\.0000 ~', $out);
+    }
+
+    #[Test]
+    public function a_rotated_background_fills_the_page_in_its_display_orientation(): void
+    {
+        $pdf = new Document(credit: CreditOptions::disabled());
+        $pdf->addPage()->importPageAsBackground($this->fixture('rotated.pdf'), 2);
+
+        $out = $pdf->output();
+
+        // A4 portrait (595.28 x 841.89 pt) filled by an 842 x 595 displayed
+        // page: x scales by 595.28/842, y by 841.89/595.
+        self::assertMatchesRegularExpression('~q\n0\.0000 -1\.414\d+ 0\.70\d+ 0\.0000 ~', $out);
     }
 
     #[Test]

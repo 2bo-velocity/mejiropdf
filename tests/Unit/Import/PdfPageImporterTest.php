@@ -102,6 +102,37 @@ final class PdfPageImporterTest extends TestCase
     }
 
     #[Test]
+    public function a_source_without_a_rotate_is_upright(): void
+    {
+        self::assertSame(0, PdfPageImporter::import($this->fixture('vector.pdf'))->rotate);
+    }
+
+    /**
+     * The fixture's /Pages node carries /Rotate 270 and a portrait MediaBox, so
+     * every page is the same size and differs only in how it is turned.
+     *
+     * @return iterable<string, array{int, int}> [page number, expected rotation]
+     */
+    public static function rotations(): iterable
+    {
+        yield 'inherited from the /Pages node' => [1, 270];
+        yield 'the page overrides its ancestor' => [2, 90];
+        yield 'a negative value normalises' => [3, 270];
+        yield 'a value that is not a quarter turn is ignored' => [4, 0];
+    }
+
+    #[Test]
+    #[\PHPUnit\Framework\Attributes\DataProvider('rotations')]
+    public function it_reads_the_display_rotation(int $pageNumber, int $expected): void
+    {
+        $page = PdfPageImporter::import($this->fixture('rotated.pdf'), $pageNumber);
+
+        self::assertSame($expected, $page->rotate);
+        // The rotation is reported alongside the MediaBox, never folded into it.
+        self::assertSame('0 0 595 842', $page->bbox);
+    }
+
+    #[Test]
     public function it_rejects_a_missing_page(): void
     {
         $this->expectException(PdfImportException::class);
