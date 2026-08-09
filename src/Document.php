@@ -32,20 +32,30 @@ use MejiroPDF\Font\FontResolver;
 use MejiroPDF\Font\GlyphCoverage;
 use MejiroPDF\Font\StandardFont;
 use MejiroPDF\Font\TrueTypeFont;
+use MejiroPDF\Font\VerticalCidFont;
 use MejiroPDF\Font\TrueTypeSubsetter;
 use MejiroPDF\Image\Image;
 use MejiroPDF\Image\RasterImage;
 use MejiroPDF\Layout\Anchor;
 use MejiroPDF\Layout\BorderBox;
 use MejiroPDF\Layout\BorderStyle;
+use MejiroPDF\Layout\FlowRegion;
 use MejiroPDF\Layout\GridColumn;
 use MejiroPDF\Layout\GridTable;
 use MejiroPDF\Layout\LineStyle;
+use MejiroPDF\Layout\Section;
 use MejiroPDF\Import\ImportedPage;
 use MejiroPDF\Import\PdfImportException;
 use MejiroPDF\Import\PdfPageImporter;
 use MejiroPDF\Page\Alignment;
+use MejiroPDF\Page\BindingEdge;
 use MejiroPDF\Page\CreditOptions;
+use MejiroPDF\Page\DocumentInfo;
+use MejiroPDF\Page\NumberStyle;
+use MejiroPDF\Page\OpenFit;
+use MejiroPDF\Page\ReadingDirection;
+use MejiroPDF\Page\RunningHeadLevel;
+use MejiroPDF\Page\RunningHeadOptions;
 use MejiroPDF\Page\PageNumberOptions;
 use MejiroPDF\Exception\SecurityException;
 use MejiroPDF\Page\PageSize;
@@ -62,6 +72,8 @@ use MejiroPDF\Template\ElementPainter;
 use MejiroPDF\Template\TemplateRenderer;
 use MejiroPDF\Text\Hyphenator;
 use MejiroPDF\Text\JapaneseTextEncoder;
+use MejiroPDF\Text\FootnoteStyle;
+use MejiroPDF\Text\FormattedLine;
 use MejiroPDF\Text\LineBreaker;
 use MejiroPDF\Text\Pagination;
 use MejiroPDF\Text\PdfEscaper;
@@ -70,6 +82,7 @@ use MejiroPDF\Text\TextToken;
 use MejiroPDF\Text\TextTokenizer;
 use MejiroPDF\Text\Typesetter;
 use MejiroPDF\Text\TypesetterOptions;
+use MejiroPDF\Text\VerticalFaces;
 use MejiroPDF\Text\TypesetResult;
 use MejiroPDF\Writer\DocumentWriter;
 use Psr\Log\LoggerInterface;
@@ -167,6 +180,45 @@ final class Document
     /** Lazily built the first time hyphenation is used. */
     private ?Hyphenator $hyphenator = null;
     private ?PageNumberOptions $pageNumbers = null;
+    private ?RunningHeadOptions $runningHead = null;
+
+    /** @var array<string, int> Descendant CIDFont object per PostScript name, shared by the H and V parents. */
+    private array $cidDescendants = [];
+
+    /** Set once anything is typeset vertically; {@see ReadingDirection::AUTO} reads it. */
+    private bool $vertical = false;
+
+    /**
+     * Page-numbering sequences by the page they start on, in order. Kept as
+     * ranges rather than per page, for the same reason as the running heads:
+     * a book has a handful of sequences and a great many pages.
+     *
+     * @var list<array{from: int, style: NumberStyle, start: int}>
+     */
+    private array $numberingRestarts = [];
+
+    /** Footnotes numbered so far, so a second flow continues the sequence. */
+    private int $footnoteCount = 0;
+
+    /**
+     * Running heads by the page they start on. Kept as ranges rather than
+     * per page: a book has few chapters and many pages.
+     *
+     * The face travels with the words. A running head carries the author's
+     * own text, and the document's default face is very often Helvetica while
+     * the book is set in something that can spell it.
+     *
+     * @var list<array{from: int, text: string, font: FontFace|null}>
+     */
+    private array $runningHeads = [];
+
+    /**
+     * Subheadings by the page they fall on, the recto's half of a spread.
+     * Same shape and same reasoning as {@see $runningHeads}.
+     *
+     * @var list<array{from: int, text: string, font: FontFace|null}>
+     */
+    private array $runningSections = [];
 
     private ?PageSize $currentSize = null;
 
@@ -177,6 +229,9 @@ final class Document
     private int $rotationDepth = 0;
 
     private string $content = '';
+
+    /** Length of {@see $content} when the current page was still blank. */
+    private int $blankContentLength = 0;
     private bool $pageOpen = false;
     private bool $finalized = false;
 
@@ -221,6 +276,9 @@ final class Document
         ?LoggerInterface $logger = null,
         private readonly bool $debugGuides = false,
         private readonly bool $strictCanvas = false,
+        private readonly DocumentInfo $info = new DocumentInfo(),
+        private readonly ReadingDirection $direction = ReadingDirection::AUTO,
+        private readonly OpenFit $openFit = OpenFit::VIEWER_DEFAULT,
     ) {
         // Defence in depth: the eager bootstrap guard normally fires first, but
         // this also covers a host that instantiates Document via a custom loader.
@@ -359,6 +417,44 @@ final class Document
         return $this;
     }
 
+    /**
+     * Repeat each chapter's name at the top of its pages. The text comes from
+     * the {@see Section}s themselves; this decides how it is drawn.
+     */
+    public function setRunningHead(RunningHeadOptions $options): self
+    {
+        $this->assertNotFinalized();
+        $this->runningHead = $options;
+
+        return $this;
+    }
+
+    /**
+     * Begin a new page-numbering sequence at the next page: the front matter
+     * runs i, ii, iii and the body starts again at 1, so material can be added
+     * to either without renumbering the other.
+     *
+     * Pages before the first call keep the sequence
+     * {@see PageNumberOptions} describes. `{TOTAL}` counts the pages of the
+     * sequence a page belongs to, not the document — the only reading that
+     * makes sense once there is more than one.
+     */
+    public function restartPageNumbering(NumberStyle $style, int $from = 1): self
+    {
+        $this->assertNotFinalized();
+        $this->numberingRestarts[] = [
+            // The sequence begins with the *next* page opened — the call sits
+            // between the front matter and the body, not inside either.
+            // pageCount() counts the open page, which count($this->pages) does
+            // not: a page joins that list only when the next one commits it.
+            'from' => $this->pageCount() + 1,
+            'style' => $style,
+            'start' => $from,
+        ];
+
+        return $this;
+    }
+
     public function setPageNumbers(PageNumberOptions $options): self
     {
         $this->pageNumbers = $options;
@@ -413,8 +509,11 @@ final class Document
         // takes the opposite route: it goes into the footer stream, which the
         // page lists after the body (see buildFooter).
         if (!$this->credit->enabled) {
-            $this->content .= $this->creditMarkerOps($this->currentSize);
+            $this->content .= $this->creditMarkerOps($this->currentSize, \count($this->pages) + 1);
         }
+        // Anything beyond this point is the page's own content, which is how
+        // section() can tell a fresh page from one already written on.
+        $this->blankContentLength = \strlen($this->content);
 
         return $this;
     }
@@ -544,12 +643,42 @@ final class Document
     }
 
     /**
-     * Flow multi-paragraph text down a page and **auto-paginate**: lines are
-     * placed from $topY within [$topY, $bottomY] mm; when the next line would
-     * cross $bottomY a new page is started and the text continues. Paragraphs
-     * (blank lines) are kept off page edges per {@see TypesetterOptions::$minLinesAtPageBreak}
-     * (widow/orphan control). Returns the Y (mm) just below the last line on the
-     * final page. Horizontal writing only.
+     * Flow multi-paragraph text through a region and **auto-paginate**: lines
+     * stack from the region's start edge, and when the next one would cross its
+     * limit a new page is started and the text continues. Paragraphs are kept
+     * off page edges per {@see TypesetterOptions::$minLinesAtPageBreak}
+     * (widow/orphan control).
+     *
+     * Works in either direction — `vertical-rl` stacks columns leftward from
+     * the region's right edge — because {@see FlowRegion} holds the mapping
+     * from the text's own axes onto the page's.
+     *
+     * Returns the block-axis coordinate (mm) just past the last line on the
+     * final page: below it when horizontal, left of it when vertical.
+     */
+    public function flowInto(
+        FlowRegion $region,
+        string $text,
+        ?FontFace $font = null,
+        float $size = 11.0,
+        ?TypesetterOptions $options = null,
+        float $gutter = 0.0,
+        ?FootnoteStyle $footnotes = null,
+    ): float {
+        return $this->renderFlow($region, $text, $font, $size, $options, $gutter, 0.0, $footnotes);
+    }
+
+    /**
+     * Flow multi-paragraph text and auto-paginate, addressed by four scalars
+     * instead of a {@see FlowRegion} — kept because it is the older spelling.
+     *
+     * The arguments follow the reading flow, exactly as {@see typeset()} does:
+     * horizontally (x, $topY) is the top-left corner, $width is the line width
+     * and $bottomY is the lowest the text may reach; vertically (x, $topY) is
+     * the top-**right** corner, $width is the column height and $bottomY is the
+     * **leftmost x** the columns may reach. Prefer {@see flowInto()} when
+     * setting vertically — `FlowRegion::vertical()` names its arguments and
+     * this signature cannot.
      */
     public function flowText(
         string $text,
@@ -561,84 +690,268 @@ final class Document
         float $size = 11.0,
         ?TypesetterOptions $options = null,
     ): float {
+        $mode = ($options ?? new TypesetterOptions())->writingMode;
+
+        return $this->renderFlow(
+            FlowRegion::for($mode, $x, $topY, $width, $bottomY),
+            $text,
+            $font,
+            $size,
+            $options,
+        );
+    }
+
+    /**
+     * The one implementation behind {@see flowInto()} and {@see flowText()}.
+     *
+     * Nothing here branches on writing mode: line breaking measures along the
+     * inline axis, {@see Typesetter::lineHeight()} measures along the block
+     * axis, and {@see Pagination} plans in block-axis **offsets**. Only the
+     * region knows which page coordinate an offset lands on.
+     */
+    private function renderFlow(
+        FlowRegion $region,
+        string $text,
+        ?FontFace $font,
+        float $size,
+        ?TypesetterOptions $options,
+        float $gutter = 0.0,
+        float $firstPageInset = 0.0,
+        ?FootnoteStyle $footnotes = null,
+    ): float {
         $this->ensurePage();
         $font ??= $this->defaultFont;
         $options ??= new TypesetterOptions();
-        if ($options->writingMode->isVertical()) {
-            throw new \LogicException('flowText() supports horizontal writing only.');
+        $this->vertical = $this->vertical || $options->writingMode->isVertical();
+        if ($options->writingMode !== $region->writingMode) {
+            throw new \LogicException('The flow region and the typesetter options disagree about the writing mode.');
         }
 
         $tokens = TextTokenizer::tokenize($text);
+        if ($footnotes !== null && ($footnotes->reserve === null || $footnotes->reserve > 0.0)) {
+            $tokens = $this->numberFootnotes($tokens, $footnotes, $size);
+        } else {
+            $tokens = self::literalFootnotes($tokens);
+        }
         if ($options->enableSmartQuotes) {
             $tokens = \array_map(
-                static fn (TextToken $t): TextToken => new TextToken(SmartPunctuation::apply($t->text), $t->rubyText, $t->style),
+                static fn (TextToken $t): TextToken => new TextToken(SmartPunctuation::apply($t->text), $t->rubyText, $t->style, $t->footnote),
                 $tokens,
             );
         }
 
-        $lines = (new LineBreaker(FontMetrics::for($font), $size, $options, $options->enableHyphenation ? $this->hyphenator() : null))->break($tokens, PageSize::mm($width));
-        if ($lines === []) {
-            return $topY;
+        if ($region->columns > 1 && $footnotes !== null && !$footnotes->inMargin()) {
+            // The band belongs to the page, not to a column, so its depth can
+            // only be settled once every column of the page has been filled —
+            // and the columns already drawn would have to be laid out again
+            // against it. Refusing is better than drawing one band per column
+            // on top of another. Margin notes have no such trouble: they sit
+            // outside the region and take nothing from it.
+            throw new \LogicException('Footnotes in a multi-column flow are not supported yet.');
+        }
+        if ($footnotes !== null && $footnotes->inMargin() && $region->isVertical()) {
+            // Vertical text stacks its columns across the very margin a side
+            // note would occupy, so where the note should go is undecided
+            // rather than merely unimplemented.
+            throw new \LogicException('Margin notes are supported in horizontal writing only.');
         }
 
-        $typesetter = new Typesetter($options);
+        $breaker = new LineBreaker(FontMetrics::for($font), $size, $options, $options->enableHyphenation ? $this->hyphenator() : null);
+        $typesetter = new Typesetter($options, $this->verticalFaces($options, $font));
+        // The region signs the block axis so the planner always sees it
+        // increasing; it never learns that vertical text runs leftward.
+        $paginator = new Pagination(
+            $region->planStart(),
+            $region->planLimit(),
+            $options->minLinesAtPageBreak,
+            // A heading already standing at the top of the first page pushes
+            // the body down; the pages after it start where they always would.
+            $firstPageInset > 0.0 ? $region->planStart() + $firstPageInset : null,
+        );
+
+        // Resolved once, before any glyph is tracked, so font resources are
+        // numbered in the order they were before this flow became incremental.
         $resource = $this->fonts->resourceName($font);
         $encode = fn (string $run): string => $this->showOperand($font, $run);
 
-        $heights = [];
-        $paragraphEnd = [];
-        foreach ($lines as $line) {
-            foreach ($line->units as $unit) {
-                $this->fonts->track($font, $unit->text);
-                if ($unit->rubyText !== null) {
-                    $this->fonts->track($this->rubyFace($options, $font, $unit->rubyText), $unit->rubyText);
+        // Resolved once per page: the band a footnote needs is either stated
+        // or worked out by laying the page out again (see below).
+        // A margin note is drawn outside the region, so it keeps no band and
+        // never sends a page back to be laid out again.
+        $stated = $footnotes !== null && $footnotes->inMargin() ? 0.0 : $footnotes?->reserve;
+        $automatic = $footnotes !== null && $stated === null;
+
+        // Paragraphs are pulled as the pages ask for them and held only while
+        // the page they touch is still being decided, so memory follows the
+        // size of a page rather than the length of the book.
+        $paragraphs = $breaker->paragraphs($tokens, PageSize::mm($region->columnExtent()));
+        /** @var list<array{lines: list<FormattedLine>, heights: list<float>, keepWithNext: bool}> $queue */
+        $queue = [];
+        $pull = function () use ($paragraphs, &$queue, $typesetter, $size, $font, $options): bool {
+            if (!$paragraphs->valid()) {
+                return false;
+            }
+            $paragraph = $paragraphs->current();
+            $paragraphs->next();
+
+            $heights = [];
+            foreach ($paragraph as $line) {
+                // Track every rendered glyph (incl. ruby) so an embedded font
+                // subsets them in — otherwise they would render blank.
+                foreach ($line->units as $unit) {
+                    $this->fonts->track($font, $unit->text);
+                    if ($unit->rubyText !== null) {
+                        $this->fonts->track($this->rubyFace($options, $font, $unit->rubyText), $unit->rubyText);
+                    }
+                }
+                $heights[] = $typesetter->lineHeight($line, $size) / PageSize::MM_TO_PT;
+            }
+            // A subheading must not end a page: noted here so the page being
+            // filled can check what follows it.
+            $keep = false;
+            foreach ($paragraph as $line) {
+                foreach ($line->units as $unit) {
+                    $keep = $keep || $unit->style->keepWithNext;
                 }
             }
-            $heights[] = $typesetter->lineHeight($line, $size) / PageSize::MM_TO_PT;
-            $paragraphEnd[] = $line->isLastInParagraph;
-        }
+            $queue[] = ['lines' => $paragraph, 'heights' => $heights, 'keepWithNext' => $keep];
 
-        $plan = Pagination::plan($heights, $paragraphEnd, $topY, $bottomY, $options->minLinesAtPageBreak);
+            return true;
+        };
 
-        // Render each page's run of lines as one segment, adding pages in order.
-        $count = \count($lines);
+        // The planner still fills one block after another; what a block *is*
+        // becomes a column rather than a page. Slot n lands on page n div
+        // columns, column n mod columns — so a column break is a page break one
+        // step shallower, and the planner never learns the difference.
+        $columns = $region->columns;
+        $slot = 0;
+        $pageCursor = $firstPageInset > 0.0 ? $region->planStart() + $firstPageInset : $region->planStart();
         $currentPage = 0;
-        $index = 0;
-        while ($index < $count) {
-            $page = $plan[$index]['page'];
-            while ($currentPage < $page) {
-                $this->addPage();
-                $currentPage++;
+        $lastEnd = null;
+
+        while ($queue !== [] || $pull()) {
+            $reserve = $stated ?? 0.0;
+            // Set when a subheading turns out to end the page: the page is
+            // filled again, stopping short of it. -1 means no such limit.
+            /** @var int $stopBefore */
+            $stopBefore = -1;
+
+            // Filling the page can change what it owes: a line carrying a note
+            // may be the one that no longer fits once the note's room is taken
+            // out. Laying it out again converges because the band only grows.
+            for ($attempt = 0; ; $attempt++) {
+                $paginator->startPage($slot, $pageCursor);
+                $paginator->setBottom($region->planLimit() - $reserve);
+
+                /** @var list<FormattedLine> $lines */
+                $lines = [];
+                /** @var list<array{0: string, 1: string, 2: float}> $notes */
+                $notes = [];
+                $retry = false;
+                $startAt = null;
+                $endAt = 0.0;
+                $whole = 0;
+                $split = null;
+
+                for ($index = 0; ; $index++) {
+                    if ($stopBefore >= 0 && $index >= $stopBefore) {
+                        break;
+                    }
+                    if (!isset($queue[$index]) && !$pull()) {
+                        break;
+                    }
+                    $item = $queue[$index];
+                    $places = $paginator->place($item['heights']);
+
+                    $taken = 0;
+                    foreach ($places as $place) {
+                        if ($place['page'] !== $slot) {
+                            break;
+                        }
+                        $startAt ??= $place['y'];
+                        $endAt = $place['y'] + $item['heights'][$taken];
+                        foreach ($item['lines'][$taken]->units as $unit) {
+                            if ($unit->footnote !== null) {
+                                $notes[] = [$unit->text, $unit->footnote, $place['y']];
+                            }
+                        }
+                        $lines[] = $item['lines'][$taken];
+                        $taken++;
+                    }
+
+                    // A heading holds on to the opening of what follows it. Too
+                    // little of that on this page and the heading goes over the
+                    // leaf as well — unless it opens the page, where there is
+                    // nowhere earlier to put it.
+                    if ($index > 1
+                        && $queue[$index - 1]['keepWithNext']
+                        && $taken < \min($options->keepWithNextLines, \count($places))
+                        && $stopBefore < 0
+                    ) {
+                        $stopBefore = $index - 1;
+                        $retry = true;
+                        break;
+                    }
+
+                    if ($taken < \count($places)) {
+                        $split = [$index, $taken];
+                        break;
+                    }
+                    $whole = $index + 1;
+                }
+
+                if ($retry) {
+                    $retry = false;
+                    continue;
+                }
+
+                if (!$automatic || $footnotes === null) {
+                    break;
+                }
+                $needed = $notes === [] ? 0.0 : $this->footnotesDepth($notes, $region, $footnotes, $font, $options);
+                // Only ever grows, so this settles; the cap is a backstop
+                // against a page too shallow to hold even one line and a note.
+                if ($needed <= $reserve + 1.0e-6 || $attempt >= 7) {
+                    break;
+                }
+                $reserve = $needed;
             }
 
-            $runEnd = $index;
-            while ($runEnd < $count && $plan[$runEnd]['page'] === $page) {
-                $runEnd++;
+            if ($lines !== []) {
+                while ($currentPage < \intdiv($slot, $columns)) {
+                    $this->addPage();
+                    $currentPage++;
+                }
+                $this->drawFlowPage($lines, $notes, (float) $startAt, $endAt, $reserve, $region->column($slot % $columns), $typesetter, $size, $font, $options, $resource, $encode, $gutter, $footnotes);
+                $lastEnd = $endAt;
+                // Now that the page is settled rather than being tried, any
+                // subheading on it names it. The last one wins: it is where the
+                // reader stands when they leave the page.
+                $this->registerSubheadings($lines, $font);
             }
 
-            $segment = \array_slice($lines, $index, $runEnd - $index);
-            $segmentTop = $plan[$index]['y'];
-            $segmentHeight = $plan[$runEnd - 1]['y'] + $heights[$runEnd - 1] - $segmentTop;
+            // Whole paragraphs are done with; a paragraph the page cut through
+            // goes back at the front as its own remainder, to be placed from
+            // the top of the next page.
+            $queue = \array_values(\array_slice($queue, $whole));
+            if ($split !== null && $split[1] > 0) {
+                $queue[0] = [
+                    'lines' => \array_values(\array_slice($queue[0]['lines'], $split[1])),
+                    'heights' => \array_values(\array_slice($queue[0]['heights'], $split[1])),
+                    // The heading is on the page just drawn; its remainder is
+                    // ordinary text now.
+                    'keepWithNext' => false,
+                ];
+            }
 
-            $this->assertOnCanvas('Flowed text', $x, $segmentTop, $width, $segmentHeight);
-            $this->content .= $typesetter->render(
-                $segment,
-                PageSize::mm($x),
-                $this->pageHeightPt() - PageSize::mm($segmentTop),
-                PageSize::mm($width),
-                $size,
-                $resource,
-                $encode,
-                ...$this->rubyHandles($options, $font),
-            )->operators;
-            // One frame per page, so a paginated flow shows where each page's
-            // share of the text actually landed.
-            $this->debugGuide($x, $segmentTop, $width, $segmentHeight, self::GUIDE_TEXT);
-
-            $index = $runEnd;
+            if ($queue === [] && !$paragraphs->valid()) {
+                break;
+            }
+            $slot++;
+            $pageCursor = $region->planStart();
         }
 
-        return $plan[$count - 1]['y'] + $heights[$count - 1];
+        return $lastEnd === null ? $region->blockStart : $region->blockAt($lastEnd);
     }
 
     /**
@@ -1129,23 +1442,25 @@ final class Document
         $font ??= $this->defaultFont;
         $options ??= new TypesetterOptions();
 
+        $this->vertical = $this->vertical || $options->writingMode->isVertical();
+
         $tokens = $options->skipsInlineMarkup()
             ? [new TextToken($text)]
-            : TextTokenizer::tokenize($text);
+            : self::literalFootnotes(TextTokenizer::tokenize($text));
 
         // A block-level style (colour, underline) sits under whatever inline
         // markup produced, so a run can still override the colour it inherits.
         $base = $options->baseStyle;
         if ($base !== null) {
             $tokens = \array_map(
-                static fn (TextToken $t): TextToken => new TextToken($t->text, $t->rubyText, $t->style->over($base)),
+                static fn (TextToken $t): TextToken => new TextToken($t->text, $t->rubyText, $t->style->over($base), $t->footnote),
                 $tokens,
             );
         }
 
         if ($options->enableSmartQuotes) {
             $tokens = \array_map(
-                static fn (TextToken $t): TextToken => new TextToken(SmartPunctuation::apply($t->text), $t->rubyText, $t->style),
+                static fn (TextToken $t): TextToken => new TextToken(SmartPunctuation::apply($t->text), $t->rubyText, $t->style, $t->footnote),
                 $tokens,
             );
         }
@@ -1184,7 +1499,7 @@ final class Document
             }
         }
 
-        $result = (new Typesetter($options))->render(
+        $result = (new Typesetter($options, $this->verticalFaces($options, $font)))->render(
             $lines,
             $xPt,
             $topYPt,
@@ -1233,6 +1548,456 @@ final class Document
         }
 
         return $cap;
+    }
+
+    /**
+     * The vertical faces for a block, or null when they would make no
+     * difference: horizontal writing, or a face with no vertical CMap.
+     *
+     * Only the built-in Japanese CIDFonts have one. An embedded TrueType is
+     * addressed through `Identity-H`, where a CID *is* a glyph id and no
+     * mapping to vertical forms exists — those runs keep stacking glyph by
+     * glyph until the engine reads `vert`/`vrt2` itself.
+     */
+    private function verticalFaces(TypesetterOptions $options, FontFace $font): ?VerticalFaces
+    {
+        if (!$options->writingMode->isVertical()) {
+            return null;
+        }
+
+        $body = VerticalCidFont::of($font);
+        if (!$body instanceof VerticalCidFont) {
+            return null;
+        }
+
+        $ruby = $options->rubyStyle->font;
+        $rubyVertical = $ruby === null || $ruby === $font ? null : VerticalCidFont::of($ruby);
+
+        return new VerticalFaces(
+            $this->fonts->resourceName($body),
+            fn (string $run): string => $this->showOperand($body, $run),
+            $rubyVertical instanceof VerticalCidFont ? $this->fonts->resourceName($rubyVertical) : null,
+            $rubyVertical instanceof VerticalCidFont
+                ? fn (string $run): string => $this->showOperand($rubyVertical, $run)
+                : null,
+        );
+    }
+
+    /**
+     * Set a chapter: break the page, place the heading at the start of the
+     * region, leave a gap, register a bookmark, and flow the body through what
+     * remains — with the body starting below the heading on this page and at
+     * the region's own start on every page after it.
+     *
+     * Returns the block-axis coordinate just past the last line, as
+     * {@see flowInto()} does, so anything following knows where the chapter
+     * ended.
+     */
+    public function section(
+        Section $section,
+        FlowRegion $region,
+        ?FontFace $font = null,
+        float $size = 11.0,
+        ?TypesetterOptions $options = null,
+        float $gutter = 0.0,
+        ?FootnoteStyle $footnotes = null,
+    ): float {
+        $font ??= $this->defaultFont;
+        $options ??= new TypesetterOptions();
+
+        $this->ensurePage();
+        if ($section->startsOnNewPage && \strlen($this->content) > $this->blankContentLength) {
+            $this->addPage(); // only when this page has already been written on
+        }
+
+        // The heading occupies the first column's first line, then the gap.
+        // It does not span the columns: only the first slot is inset for it, so
+        // a spanning heading would have the second column run over it.
+        $headingRegion = $region->column(0)->shiftedForSpread(
+            $gutter,
+            \count($this->pages) + 1,
+            $this->direction->resolve($this->vertical || $options->writingMode->isVertical()) === 'R2L',
+        );
+        [$headX, $headY] = $headingRegion->originAt($headingRegion->planStart());
+        $consumed = $this->flow(
+            $section->title,
+            $headX,
+            $headY,
+            $region->columnExtent(),
+            $section->titleFont ?? $font,
+            $section->titleSize ?? $size,
+            $options,
+        );
+
+        if ($section->bookmarkLevel !== null) {
+            $this->bookmark($section->title, $section->bookmarkLevel);
+        }
+
+        $head = $section->runningHeadText();
+        if ($head !== null) {
+            $this->runningHeads[] = [
+                'from' => \count($this->pages) + 1,
+                'text' => $head,
+                'font' => $section->titleFont ?? $font,
+            ];
+            // A section belongs to its chapter. Left standing, the last section
+            // of one chapter would name the rectos of the next until that
+            // chapter happened to have a subheading of its own.
+            $this->runningSections[] = [
+                'from' => \count($this->pages) + 1,
+                'text' => '',
+                'font' => null,
+            ];
+        }
+
+        $inset = $consumed + $section->gap * $size * $options->lineHeight / PageSize::MM_TO_PT;
+
+        return $this->renderFlow($region, $section->body, $font, $size, $options, $gutter, $inset, $footnotes);
+    }
+
+    /**
+     * Name the section the pages from here on belong to, for the running head.
+     *
+     * Flowed prose needs no such call — a `.subhead` paragraph names its own
+     * page. This is for a subheading drawn some other way, and for clearing the
+     * name again with an empty string when a chapter's last section ends.
+     */
+    public function runningSection(?string $text, ?FontFace $font = null): self
+    {
+        $this->ensurePage();
+        $this->runningSections[] = [
+            'from' => $this->pageCount(),
+            'text' => $text ?? '',
+            'font' => $font,
+        ];
+
+        return $this;
+    }
+
+    /**
+     * Record the subheadings of a page that has just been drawn.
+     *
+     * @param list<FormattedLine> $lines
+     */
+    private function registerSubheadings(array $lines, FontFace $font): void
+    {
+        $page = $this->pageCount();
+        foreach ($lines as $line) {
+            $text = '';
+            foreach ($line->units as $unit) {
+                if ($unit->style->isSubheading) {
+                    $text .= $unit->text;
+                }
+            }
+            if ($text === '') {
+                continue;
+            }
+            // A subheading wrapping onto a second line extends the same entry
+            // rather than starting another.
+            $last = \array_key_last($this->runningSections);
+            if ($last !== null && $this->runningSections[$last]['from'] === $page) {
+                $this->runningSections[$last]['text'] .= $text;
+                // Whatever stood here — a cleared entry carries no face — the
+                // words are the flow's and must be set in the flow's face.
+                $this->runningSections[$last]['font'] = $font;
+
+                continue;
+            }
+            $this->runningSections[] = ['from' => $page, 'text' => $text, 'font' => $font];
+        }
+    }
+
+    /**
+     * Whichever range covers this page, or null when none does or it is blank.
+     *
+     * @param  list<array{from: int, text: string, font: FontFace|null}> $ranges
+     * @return array{from: int, text: string, font: FontFace|null}|null
+     */
+    private static function rangeAt(array $ranges, int $physicalPage): ?array
+    {
+        $found = null;
+        foreach ($ranges as $range) {
+            if ($range['from'] > $physicalPage) {
+                break;
+            }
+            $found = $range;
+        }
+
+        return $found === null || $found['text'] === '' ? null : $found;
+    }
+
+    /**
+     * The running head for this page: the chapter it falls in on one side of
+     * the spread and the section on the other, or nothing when no chapter has
+     * started, none was asked for, or the page is a chapter's own opening —
+     * where the heading already says it.
+     *
+     * A side asks for a level and takes the other when that level has nothing
+     * to say, so a book without subheadings sets its chapter on every page,
+     * exactly as it did before there were two levels.
+     */
+    private function runningHeadOps(int $physicalPage, PageSize $size): string
+    {
+        $opts = $this->runningHead;
+        if ($opts === null || ($this->runningHeads === [] && $this->runningSections === [])) {
+            return '';
+        }
+
+        foreach ($this->runningHeads as $chapter) {
+            if ($chapter['from'] > $physicalPage) {
+                break;
+            }
+            if ($opts->skipChapterOpenings && $chapter['from'] === $physicalPage) {
+                return '';
+            }
+        }
+
+        // Verso is the back of a leaf, so the even page, whichever edge the
+        // book is bound on.
+        $wanted = $physicalPage % 2 === 0 ? $opts->verso : $opts->recto;
+        if ($wanted === RunningHeadLevel::NONE) {
+            return '';
+        }
+        $chapter = self::rangeAt($this->runningHeads, $physicalPage);
+        $section = self::rangeAt($this->runningSections, $physicalPage);
+
+        $range = $wanted === RunningHeadLevel::CHAPTER
+            ? $chapter ?? $section
+            : $section ?? $chapter;
+        if ($range === null) {
+            return '';
+        }
+        $text = $range['text'];
+
+        $font = $opts->font ?? $range['font'] ?? $this->defaultFont;
+        $ref = $this->fonts->resourceName($font);
+        $width = $this->fonts->metrics($font)->textWidth($text, $opts->fontSize);
+        $x = $this->alignX($this->side($opts->alignment, $physicalPage), $size->width, $width, PageSize::mm($opts->marginSide));
+        $y = $size->height - PageSize::mm($opts->marginTop);
+        $this->fonts->track($font, $text);
+
+        return $this->textOps(
+            $ref,
+            $opts->fontSize,
+            $x,
+            $y,
+            $this->showOperand($font, $text),
+            $opts->color === null ? null : $this->hexToRg($opts->color),
+        );
+    }
+
+    /**
+     * Put `((…))` back as it was written, for the calls that cannot set a note
+     * at the foot of a page.
+     *
+     * Only a flow paginates, and only a flow can therefore place a footnote;
+     * {@see typeset()} and its relatives draw one block wherever they are told
+     * to. Swallowing the markup there would delete the author's words without
+     * saying so, which is worse than printing the brackets.
+     *
+     * @param  list<TextToken> $tokens
+     * @return list<TextToken>
+     */
+    private static function literalFootnotes(array $tokens): array
+    {
+        foreach ($tokens as $index => $token) {
+            if ($token->footnote !== null) {
+                $tokens[$index] = new TextToken('((' . $token->footnote . '))', $token->rubyText, $token->style);
+            }
+        }
+
+        return $tokens;
+    }
+
+    /**
+     * Draw one page's worth of flowed lines, and the notes it owes beneath
+     * them.
+     *
+     * @param list<FormattedLine>               $lines
+     * @param list<array{0: string, 1: string, 2: float}> $notes
+     */
+    private function drawFlowPage(
+        array $lines,
+        array $notes,
+        float $startAt,
+        float $endAt,
+        float $reserve,
+        FlowRegion $region,
+        Typesetter $typesetter,
+        float $size,
+        FontFace $font,
+        TypesetterOptions $options,
+        string $resource,
+        callable $encode,
+        float $gutter,
+        ?FootnoteStyle $footnotes,
+    ): void {
+        // Mirrored margins move the block without resizing it, so the shift
+        // belongs here and never reaches the planner.
+        $drawn = $region->shiftedForSpread(
+            $gutter,
+            \count($this->pages) + 1,
+            $this->direction->resolve($this->vertical) === 'R2L',
+        );
+
+        [$originX, $originY] = $drawn->originAt($startAt);
+        [$boxX, $boxY, $boxW, $boxH] = $drawn->boxAt($startAt, $endAt - $startAt);
+
+        $this->assertOnCanvas('Flowed text', $boxX, $boxY, $boxW, $boxH);
+        $this->content .= $typesetter->render(
+            $lines,
+            PageSize::mm($originX),
+            $this->pageHeightPt() - PageSize::mm($originY),
+            PageSize::mm($drawn->inlineExtent),
+            $size,
+            $resource,
+            $encode,
+            ...$this->rubyHandles($options, $font),
+        )->operators;
+        // One frame per page, so a paginated flow shows where each page's
+        // share of the text actually landed.
+        $this->debugGuide($boxX, $boxY, $boxW, $boxH, self::GUIDE_TEXT);
+
+        if ($footnotes !== null && $notes !== []) {
+            if ($footnotes->inMargin()) {
+                $this->drawMarginNotes($notes, $drawn, $footnotes, $font, $options);
+            } else {
+                $this->drawFootnotes($notes, $drawn->withBlockLimit($reserve), $footnotes, $reserve, $font, $options);
+            }
+        }
+    }
+
+    /**
+     * Set this page's notes in the fore-edge margin, each beside the line that
+     * refers to it — the 傍注 of a Japanese textbook.
+     *
+     * The margin is outside the region, so unlike a band at the foot this
+     * costs the body nothing and never sends the page back to be laid out
+     * again. What it does need is a rule for two references close together:
+     * notes are set in order and each is pushed down far enough to clear the
+     * one before, so a run of them drifts below their marks rather than
+     * printing on top of one another.
+     *
+     * @param list<array{0: string, 1: string, 2: float}> $notes
+     */
+    private function drawMarginNotes(
+        array $notes,
+        FlowRegion $region,
+        FootnoteStyle $style,
+        FontFace $font,
+        TypesetterOptions $options,
+    ): void {
+        $outer = $this->side(BindingEdge::OUTER, $this->pageCount());
+        $x = $outer === Alignment::LEFT
+            ? $region->inlineStart - $style->marginGap - $style->marginWidth
+            : $region->inlineStart + $region->inlineExtent + $style->marginGap;
+
+        $plain = $options->withBaseStyle(null);
+        $lowest = null;
+        foreach ($notes as [$label, $text, $planned]) {
+            $y = $region->blockAt($planned);
+            if ($lowest !== null && $y < $lowest) {
+                $y = $lowest;
+            }
+            $y += $this->flow($label . ' ' . $text, $x, $y, $style->marginWidth, $font, $style->fontSize, $plain);
+            $lowest = $y + $style->noteGap;
+        }
+
+        $overflow = ($lowest ?? 0.0) - $region->blockLimit;
+        if ($overflow > 0.0) {
+            $this->logger->warning(
+                'Margin notes on page {page} run {overflow} mm past the foot of the body.',
+                ['page' => $this->pageCount(), 'overflow' => \round($overflow, 2)],
+            );
+        }
+    }
+
+    /**
+     * How deep a band this page's notes need, measured without drawing them.
+     *
+     * @param list<array{0: string, 1: string, 2: float}> $notes
+     */
+    private function footnotesDepth(array $notes, FlowRegion $region, FootnoteStyle $style, FontFace $font, TypesetterOptions $options): float
+    {
+        $depth = $style->gapAbove + $style->gapBelow;
+        $plain = $options->withBaseStyle(null);
+        foreach ($notes as [$label, $text]) {
+            $depth += $this->measureTextHeight($label . ' ' . $text, $region->inlineExtent, $font, $style->fontSize, $plain)
+                + $style->noteGap;
+        }
+
+        return $depth;
+    }
+
+    /**
+     * Give every footnote its number and its mark, in the order the marks
+     * appear.
+     *
+     * Done before line breaking because the mark has a width: what the note is
+     * called has to be settled before anyone can ask how wide the line is.
+     *
+     * @param  list<TextToken> $tokens
+     * @return list<TextToken>
+     */
+    private function numberFootnotes(array $tokens, FootnoteStyle $style, float $size): array
+    {
+        foreach ($tokens as $index => $token) {
+            if ($token->footnote === null) {
+                continue;
+            }
+            $this->footnoteCount++;
+            $tokens[$index] = new TextToken(
+                $style->label($this->footnoteCount),
+                null,
+                $token->style->with(fontSize: $size * $style->markerScale, raise: $style->markerRaise),
+                $token->footnote,
+            );
+        }
+
+        return $tokens;
+    }
+
+    /**
+     * Set a page's notes in the band kept for them, under a short rule.
+     *
+     * The band's depth is what the caller reserved, so the notes are laid out
+     * against it rather than the other way round; a page whose notes outgrow it
+     * says so in the log rather than printing over the body.
+     *
+     * @param list<array{0: string, 1: string, 2: float}> $notes label, text, planned position
+     */
+    private function drawFootnotes(array $notes, FlowRegion $region, FootnoteStyle $style, float $reserve, FontFace $font, TypesetterOptions $options): void
+    {
+        $x = $region->isVertical() ? $region->blockLimit : $region->inlineStart;
+        $width = $region->isVertical() ? $region->inlineExtent : $region->inlineExtent;
+        $top = $region->isVertical() ? $region->inlineStart : $region->blockLimit;
+
+        $y = $top + $style->gapAbove;
+        if ($style->ruleLength > 0.0) {
+            $this->line($x, $y, $x + \min($style->ruleLength, $width), $y, $style->ruleWeight);
+        }
+        $y += $style->gapBelow;
+
+        $plain = $options->withBaseStyle(null);
+        foreach ($notes as [$label, $text]) {
+            $y += $this->flow(
+                $label . ' ' . $text,
+                $x,
+                $y,
+                $width,
+                $font,
+                $style->fontSize,
+                $plain,
+            ) + $style->noteGap;
+        }
+
+        $overflow = $y - ($top + $reserve);
+        if ($overflow > 0.0) {
+            $this->logger->warning(
+                'Footnotes on page {page} overrun their reserve by {overflow} mm; deepen FootnoteStyle::$reserve.',
+                ['page' => $this->pageCount(), 'overflow' => \round($overflow, 2)],
+            );
+        }
     }
 
     /**
@@ -2172,7 +2937,7 @@ final class Document
             $font = $entry['font'];
             $fontRefs[$entry['ref']] = match (true) {
                 $font instanceof TrueTypeFont => $this->writeTrueTypeFont($font, $entry['tracker'] ?? new CharacterTracker()),
-                $font instanceof CidFontJapanese => $this->writeCidFont($font),
+                $font instanceof CidFontJapanese, $font instanceof VerticalCidFont => $this->writeCidFont($font),
                 $font instanceof StandardFont => $this->writeStandardFont($font),
                 default => throw new \LogicException('Unsupported font face: ' . $font::class),
             };
@@ -2230,6 +2995,20 @@ final class Document
             $catalogExtra .= $this->writePdfAObjects();
         }
 
+        if ($this->info->language !== null) {
+            $catalogExtra .= \sprintf(' /Lang %s', $this->pdfTextString($this->catalogId, $this->info->language));
+        }
+
+        $direction = $this->direction->resolve($this->vertical);
+        if ($direction !== null) {
+            $catalogExtra .= \sprintf(' /ViewerPreferences << /Direction /%s >>', $direction);
+        }
+
+        $destination = $this->openFit->destination();
+        if ($destination !== null && $this->pages !== []) {
+            $catalogExtra .= \sprintf(' /OpenAction [ %d 0 R %s ]', $this->pages[0]['page'], $destination);
+        }
+
         $this->doc->writeObject($this->catalogId, \sprintf(
             '<< /Type /Catalog /Pages %d 0 R%s >>',
             $this->pagesId,
@@ -2274,9 +3053,17 @@ final class Document
         $infoId = $this->doc->allocateObjectId();
         $date = $this->createdAt->format("\\D\\:YmdHis+00'00'");
 
-        $keywords = $this->credit->enabled
-            ? ''
-            : \sprintf(' /Keywords %s', $this->pdfTextString($infoId, $this->credit->markerText()));
+        $authored = '';
+        foreach (['Title' => $this->info->title, 'Author' => $this->info->author, 'Subject' => $this->info->subject] as $key => $value) {
+            if ($value !== null) {
+                $authored .= \sprintf(' /%s %s', $key, $this->pdfTextString($infoId, $value));
+            }
+        }
+
+        $keywords = $this->keywordsValue();
+        if ($keywords !== null) {
+            $authored .= \sprintf(' /Keywords %s', $this->pdfTextString($infoId, $keywords));
+        }
 
         $this->doc->writeObject($infoId, \sprintf(
             '<< /Producer %s /Creator %s /CreationDate %s /ModDate %s%s >>',
@@ -2284,10 +3071,90 @@ final class Document
             $this->pdfTextString($infoId, 'MejiroPDF'),
             $this->pdfTextString($infoId, $date),
             $this->pdfTextString($infoId, $date),
-            $keywords,
+            $authored,
         ));
 
         return $infoId;
+    }
+
+    /**
+     * `/Keywords`, or null when there is nothing to write.
+     *
+     * The licence marker goes **first** and the author's value follows after a
+     * semicolon. First, because it is then found by a reader that stops early,
+     * cannot be pushed out of sight by a long value, and needs no scan of
+     * someone else's text to locate.
+     *
+     * The author's value is never inspected, de-duplicated or edited. A rule
+     * that stripped text matching the marker would be a rule that deletes the
+     * marker for anyone who types it out — handing over the lever in the act of
+     * tidying up. Prepend, and look away.
+     *
+     * Note for anyone auditing: once a non-ASCII keyword is present the whole
+     * string is written as UTF-16BE hex, so the marker has to be looked for in
+     * a decoded string object rather than in the file's bytes.
+     */
+    private function keywordsValue(): ?string
+    {
+        $marker = $this->credit->enabled ? null : $this->credit->markerText();
+        $authored = $this->info->keywords;
+
+        if ($marker === null) {
+            return $authored;
+        }
+
+        return $authored === null ? $marker : $marker . '; ' . $authored;
+    }
+
+    /**
+     * The authored Dublin Core properties, mirroring `/Title`, `/Author` and
+     * `/Subject`. PDF/A requires a property present in both the info dictionary
+     * and XMP to carry the same value, so these are written from the same
+     * source and escaped for XML.
+     *
+     * `dc:title` and `dc:description` are language alternatives and
+     * `dc:creator` an ordered list — the shapes the standard defines for them,
+     * not free text.
+     */
+    private function xmpDublinCore(): string
+    {
+        $xml = '';
+        foreach (['dc:title' => $this->info->title, 'dc:description' => $this->info->subject] as $tag => $value) {
+            if ($value !== null) {
+                $xml .= \sprintf(
+                    "   <%s><rdf:Alt><rdf:li xml:lang=\"x-default\">%s</rdf:li></rdf:Alt></%s>\n",
+                    $tag,
+                    self::xmlText($value),
+                    $tag,
+                );
+            }
+        }
+        if ($this->info->author !== null) {
+            $xml .= \sprintf(
+                "   <dc:creator><rdf:Seq><rdf:li>%s</rdf:li></rdf:Seq></dc:creator>\n",
+                self::xmlText($this->info->author),
+            );
+        }
+
+        return $xml;
+    }
+
+    /**
+     * `pdf:Keywords`, carrying exactly what `/Keywords` carries — including the
+     * licence marker, since the two must agree.
+     */
+    private function xmpKeywords(): string
+    {
+        $keywords = $this->keywordsValue();
+
+        return $keywords === null
+            ? ''
+            : \sprintf("   <pdf:Keywords>%s</pdf:Keywords>\n", self::xmlText($keywords));
+    }
+
+    private static function xmlText(string $value): string
+    {
+        return \htmlspecialchars($value, \ENT_XML1 | \ENT_QUOTES, 'UTF-8');
     }
 
     /**
@@ -2308,18 +3175,24 @@ final class Document
      * Emit a non-embedded Japanese composite font (a /Type0 dictionary and its
      * descendant /CIDFontType0) and return the /Type0 object id.
      */
-    private function writeCidFont(CidFontJapanese $font): int
+    private function writeCidFont(CidFontJapanese|VerticalCidFont $font): int
     {
-        $descendantId = $this->doc->allocateObjectId();
-        $this->doc->writeObject($descendantId, \sprintf(
-            '<< /Type /Font /Subtype /CIDFontType0 /BaseFont /%s '
-            . '/CIDSystemInfo << /Registry (%s) /Ordering (%s) /Supplement %d >> /DW %d >>',
-            $font->postScriptName(),
-            $font->registry(),
-            $font->ordering(),
-            $font->supplement(),
-            $font->defaultWidth(),
-        ));
+        // One descendant per typeface, shared by the horizontal and vertical
+        // parents. They differ only in which CMap reads it.
+        $descendantId = $this->cidDescendants[$font->postScriptName()] ?? null;
+        if ($descendantId === null) {
+            $descendantId = $this->doc->allocateObjectId();
+            $this->cidDescendants[$font->postScriptName()] = $descendantId;
+            $this->doc->writeObject($descendantId, \sprintf(
+                '<< /Type /Font /Subtype /CIDFontType0 /BaseFont /%s '
+                . '/CIDSystemInfo << /Registry (%s) /Ordering (%s) /Supplement %d >> /DW %d >>',
+                $font->postScriptName(),
+                $font->registry(),
+                $font->ordering(),
+                $font->supplement(),
+                $font->defaultWidth(),
+            ));
+        }
 
         $type0Id = $this->doc->allocateObjectId();
         $this->doc->writeObject($type0Id, \sprintf(
@@ -2484,12 +3357,15 @@ final class Document
         $ops = '';
 
         if ($this->credit->enabled) {
-            $ops .= $this->creditOps($size);
+            $ops .= $this->creditOps($size, $physicalPage);
         }
 
-        if ($this->pageNumbers !== null && $this->pageNumbers->shouldRender($physicalPage)) {
-            $ops .= $this->pageNumberOps($physicalPage, $total, $size);
+        $number = $this->pageNumberText($physicalPage, $total);
+        if ($number !== null && $number !== '') {
+            $ops .= $this->pageNumberOps($number, $physicalPage, $size);
         }
+
+        $ops .= $this->runningHeadOps($physicalPage, $size);
 
         return $ops;
     }
@@ -2535,12 +3411,13 @@ final class Document
         return GlyphCoverage::covers($ruby, $rubyText) ? $ruby : $font;
     }
 
-    private function creditOps(PageSize $size): string
+    private function creditOps(PageSize $size, int $physicalPage): string
     {
         return $this->creditTextOps(
             $size,
             $this->credit->text,
             \sprintf('%.3F g', $this->credit->gray),
+            $physicalPage,
         );
     }
 
@@ -2553,12 +3430,13 @@ final class Document
      * text render mode 3 precisely because ordinary extractors still pick it
      * up — invisible to a reader, plain to a parser.
      */
-    private function creditMarkerOps(PageSize $size): string
+    private function creditMarkerOps(PageSize $size, int $physicalPage): string
     {
         return $this->creditTextOps(
             $size,
             $this->credit->markerText(),
             self::fillOp($this->credit->markerColor ?? '#FFFFFF'),
+            $physicalPage,
         );
     }
 
@@ -2566,7 +3444,7 @@ final class Document
      * Shared placement for both the visible credit and the hidden marker: the
      * lower corner opposite the page number, so the two never collide.
      */
-    private function creditTextOps(PageSize $size, string $text, string $colorOp): string
+    private function creditTextOps(PageSize $size, string $text, string $colorOp, int $physicalPage = 1): string
     {
         // PDF/A forbids non-embedded fonts, so route the credit through the
         // document's (embedded) default font instead of Standard-14 Helvetica.
@@ -2575,8 +3453,13 @@ final class Document
         $metrics = $this->fonts->metrics($font);
         $width = $metrics->textWidth($text, $this->credit->fontSize);
 
-        // Place the credit on the opposite side of the page number (LEFT by default).
-        $align = $this->pageNumbers?->alignment->opposite() ?? Alignment::LEFT;
+        // Place the credit on the opposite side of the page number (LEFT by
+        // default). Resolving the page number's side first is what makes the
+        // credit follow it to the gutter when the number sits on the fore-edge.
+        $numbers = $this->pageNumbers;
+        $align = $numbers === null
+            ? Alignment::LEFT
+            : $this->side($numbers->alignment, $physicalPage)->opposite();
         $x = $this->alignX($align, $size->width, $width, PageSize::mm($this->credit->marginSide));
         $y = PageSize::mm($this->credit->marginBottom);
 
@@ -2600,17 +3483,60 @@ final class Document
         return \sprintf('%.3F %.3F %.3F rg', $r / 255.0, $g / 255.0, $b / 255.0);
     }
 
-    private function pageNumberOps(int $physicalPage, int $total, PageSize $size): string
+    /**
+     * What this page's number reads, or null when it carries none.
+     *
+     * With no restart registered this is exactly what {@see PageNumberOptions}
+     * has always produced, so a document that does not ask for sequences comes
+     * out byte for byte as before.
+     */
+    private function pageNumberText(int $physicalPage, int $total): ?string
+    {
+        $opts = $this->pageNumbers;
+        if ($opts === null) {
+            return null;
+        }
+        if ($this->numberingRestarts === []) {
+            return $opts->shouldRender($physicalPage) ? $opts->resolve($physicalPage, $total) : null;
+        }
+
+        // The last sequence that has begun by this page; none means the page
+        // is still in the leading run the options describe.
+        $current = null;
+        $end = $total;
+        foreach ($this->numberingRestarts as $sequence) {
+            if ($sequence['from'] > $physicalPage) {
+                $end = $sequence['from'] - 1;
+                break;
+            }
+            $current = $sequence;
+        }
+
+        if ($current === null) {
+            $head = $this->numberingRestarts[0]['from'] - 1;
+
+            return $opts->shouldRender($physicalPage) ? $opts->resolve($physicalPage, $head) : null;
+        }
+
+        $offset = $physicalPage - $current['from'];
+
+        return $opts->fill(
+            $current['start'] + $offset,
+            $current['start'] + ($end - $current['from']),
+            $current['style'],
+        );
+    }
+
+    private function pageNumberOps(string $text, int $physicalPage, PageSize $size): string
     {
         $opts = $this->pageNumbers;
         \assert($opts !== null);
 
         $ref = $this->fonts->resourceName($opts->font);
         $metrics = $this->fonts->metrics($opts->font);
-        $text = $opts->resolve($physicalPage, $total);
         $width = $metrics->textWidth($text, $opts->fontSize);
 
-        $x = $this->alignX($opts->alignment, $size->width, $width, PageSize::mm($opts->marginSide));
+        $x = $this->alignX($this->side($opts->alignment, $physicalPage), $size->width, $width, PageSize::mm($opts->marginSide));
         $y = PageSize::mm($opts->marginBottom);
         $colorOp = $opts->color === null ? null : $this->hexToRg($opts->color);
 
@@ -2623,6 +3549,20 @@ final class Document
     /**
      * Compute the x anchor (pt) for aligned text of the given width within a page.
      */
+    /**
+     * The physical side a page-number alignment names on this page.
+     *
+     * {@see BindingEdge} answers differently on rectos and versos, and which
+     * side the gutter falls on follows the binding — right-bound for a book
+     * that reads right to left.
+     */
+    private function side(Alignment|BindingEdge $alignment, int $physicalPage): Alignment
+    {
+        return $alignment instanceof BindingEdge
+            ? $alignment->resolve($physicalPage, $this->direction->resolve($this->vertical) === 'R2L')
+            : $alignment;
+    }
+
     private function alignX(Alignment $align, float $pageWidthPt, float $textWidthPt, float $marginPt): float
     {
         return match ($align) {
@@ -2640,7 +3580,8 @@ final class Document
     {
         return match (true) {
             $font instanceof TrueTypeFont => $font->encodeToGidHex($text),
-            $font instanceof CidFontJapanese => JapaneseTextEncoder::toCidHex($text),
+            // Both CMaps read UTF-16BE; only which CID it lands on differs.
+            $font instanceof CidFontJapanese, $font instanceof VerticalCidFont => JapaneseTextEncoder::toCidHex($text),
             default => '(' . PdfEscaper::literal($text) . ')',
         };
     }
@@ -3160,6 +4101,7 @@ final class Document
             . "  </rdf:Description>\n"
             . "  <rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\n"
             . "   <dc:format>application/pdf</dc:format>\n"
+            . $this->xmpDublinCore()
             . "  </rdf:Description>\n"
             . "  <rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\">\n"
             . "   <xmp:CreatorTool>MejiroPDF</xmp:CreatorTool>\n"
@@ -3168,6 +4110,7 @@ final class Document
             . "  </rdf:Description>\n"
             . "  <rdf:Description rdf:about=\"\" xmlns:pdf=\"http://ns.adobe.com/pdf/1.3/\">\n"
             . "   <pdf:Producer>{$producer}</pdf:Producer>\n"
+            . $this->xmpKeywords()
             . "  </rdf:Description>\n"
             . " </rdf:RDF>\n"
             . "</x:xmpmeta>\n"

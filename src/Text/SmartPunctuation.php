@@ -43,20 +43,57 @@ final class SmartPunctuation
 
         $run = \str_replace(['---', '--'], self::EM_DASH, $run);
 
+        // Only the quotes need deciding, so seek to them rather than walking
+        // every character. Splitting the run into single-character strings
+        // costs tens of bytes per character — on a book-length run that alone
+        // is more memory than the rest of the flow put together, and it is
+        // spent on characters that were never going to change.
+        $length = \strlen($run);
         $out = '';
-        $prev = '';
-        foreach (\mb_str_split($run, 1, 'UTF-8') as $char) {
-            $out .= match ($char) {
-                '"' => self::isOpening($prev) ? self::LEFT_DOUBLE : self::RIGHT_DOUBLE,
-                "'" => self::isApostrophe($prev)
+        $copied = 0;
+        $cursor = 0;
+
+        while ($cursor < $length) {
+            $cursor += \strcspn($run, '"\'', $cursor);
+            if ($cursor >= $length) {
+                break;
+            }
+
+            // Safe on bytes: a quote is ASCII, and UTF-8 never puts an ASCII
+            // byte inside a multi-byte sequence.
+            $prev = self::precedingCharacter($run, $cursor);
+            $out .= \substr($run, $copied, $cursor - $copied);
+            $out .= $run[$cursor] === '"'
+                ? (self::isOpening($prev) ? self::LEFT_DOUBLE : self::RIGHT_DOUBLE)
+                : (self::isApostrophe($prev)
                     ? self::RIGHT_SINGLE
-                    : (self::isOpening($prev) ? self::LEFT_SINGLE : self::RIGHT_SINGLE),
-                default => $char,
-            };
-            $prev = $char;
+                    : (self::isOpening($prev) ? self::LEFT_SINGLE : self::RIGHT_SINGLE));
+
+            $cursor++;
+            $copied = $cursor;
         }
 
-        return $out;
+        return $copied === 0 ? $run : $out . \substr($run, $copied);
+    }
+
+    /**
+     * The whole character before $position — walked back over UTF-8
+     * continuation bytes, because {@see isApostrophe()} asks whether the
+     * preceding character is a letter and `é` must answer as one.
+     */
+    private static function precedingCharacter(string $run, int $position): string
+    {
+        if ($position === 0) {
+            return '';
+        }
+
+        $start = $position - 1;
+        // A continuation byte is 10xxxxxx; at most three precede a lead byte.
+        while ($start > 0 && $position - $start < 4 && (\ord($run[$start]) & 0xC0) === 0x80) {
+            $start--;
+        }
+
+        return \substr($run, $start, $position - $start);
     }
 
     private static function isOpening(string $prev): bool

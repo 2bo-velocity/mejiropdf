@@ -45,6 +45,27 @@ final class SmartPunctuationTest extends TestCase
     }
 
     #[Test]
+    public function a_multibyte_letter_before_a_quote_still_reads_as_an_apostrophe(): void
+    {
+        // The scan finds quotes by byte and then walks back over UTF-8
+        // continuation bytes; if it took only the last byte, "é" would not
+        // count as a letter and the quote would open instead of close.
+        self::assertSame("caf\u{00E9}\u{2019}s", SmartPunctuation::apply("caf\u{00E9}'s"));
+        self::assertSame("\u{3042}\u{2019}", SmartPunctuation::apply("\u{3042}'"));
+        self::assertSame("\u{6F22}\u{2019}\u{5B57}", SmartPunctuation::apply("\u{6F22}'\u{5B57}"));
+    }
+
+    #[Test]
+    public function a_quote_is_judged_by_the_character_that_preceded_it_unconverted(): void
+    {
+        // The straight double quote is not itself an opening context — only the
+        // already-curled one is — so the single quote after it closes rather
+        // than opens. Longstanding behaviour, pinned here because the scan now
+        // reads that preceding character back out of the string.
+        self::assertSame("\u{201C}\u{2019}a\u{2019}\u{201D}", SmartPunctuation::apply('"\'a\'"'));
+    }
+
+    #[Test]
     public function it_leaves_text_without_punctuation_untouched(): void
     {
         self::assertSame('plain 日本語 text', SmartPunctuation::apply('plain 日本語 text'));

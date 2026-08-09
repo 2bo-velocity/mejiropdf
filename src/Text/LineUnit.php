@@ -38,6 +38,16 @@ final readonly class LineUnit
         public float $rubyWidth,
         public bool $isTcy = false,
         public bool $softHyphen = false,
+        /** Set sideways as one piece: a Latin run turned in a vertical column. */
+        public bool $isRotatedRun = false,
+        /**
+         * Signed adjustment (points) between this unit and the next, from
+         * {@see JapaneseSpacing}. Dropped at a line end, where there is no
+         * next unit for it to separate.
+         */
+        public float $spaceAfter = 0.0,
+        /** The note this unit's mark refers to, for the page it lands on. */
+        public ?string $footnote = null,
     ) {
     }
 }

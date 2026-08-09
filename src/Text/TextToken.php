@@ -27,6 +27,11 @@ final readonly class TextToken
         public string $text,
         public ?string $rubyText = null,
         public TextStyle $style = new TextStyle(),
+        /**
+         * The note this run refers to, when the run is a footnote's mark.
+         * The mark's own text is filled in once the flow numbers it.
+         */
+        public ?string $footnote = null,
     ) {
     }
 }

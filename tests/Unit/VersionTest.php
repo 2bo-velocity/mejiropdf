@@ -25,8 +25,8 @@ final class VersionTest extends TestCase
     #[Test]
     public function it_reports_a_semver_string(): void
     {
-        self::assertSame('1.1.0', Version::VERSION);
-        self::assertSame('1.1.0', Version::version());
+        self::assertSame('1.2.0', Version::VERSION);
+        self::assertSame('1.2.0', Version::version());
         self::assertMatchesRegularExpression('/^\d+\.\d+\.\d+$/', Version::version());
     }
 
@@ -42,6 +42,6 @@ final class VersionTest extends TestCase
     #[Test]
     public function the_producer_string_carries_the_version(): void
     {
-        self::assertSame('MejiroPDF 1.1.0', Version::producer());
+        self::assertSame('MejiroPDF 1.2.0', Version::producer());
     }
 }

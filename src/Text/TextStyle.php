@@ -36,6 +36,20 @@ final readonly class TextStyle
         public ?float $fontSize = null,
         public ?float $letterSpacing = null,
         public ?string $linkUrl = null,
+        /** Baseline shift in ems — a reference mark rides above the line. */
+        public float $raise = 0.0,
+        /**
+         * A subheading: never the last thing on a page. The paragraph it
+         * belongs to moves over the leaf rather than be parted from the text
+         * it introduces.
+         */
+        public bool $keepWithNext = false,
+        /**
+         * A subheading in the sense of the book's structure, not only of the
+         * page: its words become the section running head of the page it lands
+         * on. Implies {@see $keepWithNext}.
+         */
+        public bool $isSubheading = false,
     ) {
     }
 
@@ -58,6 +72,9 @@ final readonly class TextStyle
         ?float $fontSize = null,
         ?float $letterSpacing = null,
         ?string $linkUrl = null,
+        ?float $raise = null,
+        ?bool $keepWithNext = null,
+        ?bool $isSubheading = null,
     ): self {
         return new self(
             $isBold ?? $this->isBold,
@@ -72,6 +89,9 @@ final readonly class TextStyle
             $fontSize ?? $this->fontSize,
             $letterSpacing ?? $this->letterSpacing,
             $linkUrl ?? $this->linkUrl,
+            $raise ?? $this->raise,
+            $keepWithNext ?? $this->keepWithNext,
+            $isSubheading ?? $this->isSubheading,
         );
     }
 

@@ -38,10 +38,13 @@ final readonly class PageNumberOptions
      * @param int            $skipPages       Leading pages to leave un-numbered (e.g. a cover).
      * @param int            $startPageNumber Logical number printed on the first numbered page.
      * @param string|null    $color           Hex "#RRGGBB" (default black).
+     * @param NumberStyle    $style           How the number is spelled. A document
+     *                                        that changes style partway through
+     *                                        uses {@see \MejiroPDF\Document::restartPageNumbering()}.
      */
     public function __construct(
         public string $format = '{PAGE} / {TOTAL}',
-        public Alignment $alignment = Alignment::RIGHT,
+        public Alignment|BindingEdge $alignment = Alignment::RIGHT,
         public float $marginBottom = 12.0,
         public float $marginSide = 15.0,
         public StandardFont $font = StandardFont::HELVETICA,
@@ -49,6 +52,7 @@ final readonly class PageNumberOptions
         public int $skipPages = 0,
         public int $startPageNumber = 1,
         public ?string $color = null,
+        public NumberStyle $style = NumberStyle::ARABIC,
     ) {
     }
 
@@ -75,9 +79,19 @@ final readonly class PageNumberOptions
     {
         $logicalTotal = $total - $this->skipPages + ($this->startPageNumber - 1);
 
+        return $this->fill($this->logicalNumber($physicalPage), \max(0, $logicalTotal), $this->style);
+    }
+
+    /**
+     * The format string with a number and a total written in the given style —
+     * shared with {@see \MejiroPDF\Document::restartPageNumbering()}, where the
+     * sequence rather than the whole document decides both.
+     */
+    public function fill(int $number, int $total, NumberStyle $style): string
+    {
         return \strtr($this->format, [
-            '{PAGE}' => (string) $this->logicalNumber($physicalPage),
-            '{TOTAL}' => (string) \max(0, $logicalTotal),
+            '{PAGE}' => $style->format($number),
+            '{TOTAL}' => $style->format($total),
         ]);
     }
 }

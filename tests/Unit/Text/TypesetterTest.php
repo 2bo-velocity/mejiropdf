@@ -17,6 +17,7 @@ use MejiroPDF\Text\TextAlign;
 use MejiroPDF\Text\TextTokenizer;
 use MejiroPDF\Text\Typesetter;
 use MejiroPDF\Text\TypesetterOptions;
+use MejiroPDF\Text\VerticalFormStyle;
 use MejiroPDF\Text\WritingMode;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
@@ -53,6 +54,24 @@ final class TypesetterTest extends TestCase
             0.0,
             100.0,
             $boxWidth,
+            self::SIZE,
+            'F1',
+            static fn (string $run): string => '(' . $run . ')',
+        )->operators;
+    }
+
+    /** Render $markup vertically into a tall column whose top-right is (100, 100). */
+    private function vertical(string $markup): string
+    {
+        $options = new TypesetterOptions(writingMode: WritingMode::VERTICAL_RL);
+        $lines = (new LineBreaker($this->metrics(), self::SIZE, $options))
+            ->break(TextTokenizer::tokenize($markup), 100.0);
+
+        return (new Typesetter($options))->render(
+            $lines,
+            100.0,
+            100.0,
+            100.0,
             self::SIZE,
             'F1',
             static fn (string $run): string => '(' . $run . ')',
@@ -184,9 +203,68 @@ final class TypesetterTest extends TestCase
             static fn (string $run): string => '(' . $run . ')',
         )->operators;
 
-        // 本 sits centred; 。 is nudged right (+4.5) and up (+5.0) in its cell.
+        // 本 sits centred; 。 moves to the cell's upper right by 0.60 em on both
+        // axes — measured from the vertical forms two Adobe-Japan1 faces
+        // actually draw, where the engine used to guess 0.45 and 0.50.
         self::assertStringContainsString("1 0.0000 0 1 90.00 91.50 Tm\n(本) Tj", $ops);
-        self::assertStringContainsString("1 0.0000 0 1 94.50 86.50 Tm\n(。) Tj", $ops);
+        self::assertStringContainsString("1 0.0000 0 1 96.00 87.50 Tm\n(。) Tj", $ops);
+    }
+
+    #[Test]
+    public function vertical_rotating_punctuation_turns_a_quarter_clockwise(): void
+    {
+        $ops = $this->vertical('本ー」');
+
+        // Upright: centred in the cell, baseline 0.85 em below its top.
+        self::assertStringContainsString("1 0.0000 0 1 90.00 91.50 Tm\n(本) Tj", $ops);
+        // Turned: the advance runs downward and the ascender rightward, so the
+        // matrix is [0 -1 1 0] and the origin is the cell's top edge.
+        self::assertStringContainsString("0 -1 1 0 91.50 90.00 Tm\n(ー) Tj", $ops);
+        self::assertStringContainsString("0 -1 1 0 91.50 80.00 Tm\n(」) Tj", $ops);
+    }
+
+    #[Test]
+    public function vertical_small_kana_is_nudged_without_being_shrunk(): void
+    {
+        $ops = $this->vertical('本っ');
+
+        // Same size as the character before it — the glyph is already small.
+        self::assertSame(2, \substr_count($ops, '/F1 10.00 Tf'));
+        // Up and right by 0.15 / 0.12 em from where an upright glyph would sit.
+        self::assertStringContainsString("1 0.0000 0 1 91.50 82.70 Tm\n(っ) Tj", $ops);
+    }
+
+    #[Test]
+    public function the_shift_can_be_tuned_for_a_face_that_disagrees(): void
+    {
+        $tuned = new TypesetterOptions(
+            writingMode: WritingMode::VERTICAL_RL,
+            verticalFormStyle: new VerticalFormStyle(upperRightDx: 0.30, upperRightDy: 0.30),
+        );
+        $lines = (new LineBreaker($this->metrics(), self::SIZE, $tuned))
+            ->break(TextTokenizer::tokenize('本。'), 100.0);
+        $ops = (new Typesetter($tuned))->render(
+            $lines,
+            100.0,
+            100.0,
+            100.0,
+            self::SIZE,
+            'F1',
+            static fn (string $run): string => '(' . $run . ')',
+        )->operators;
+
+        // Half the default 0.60 em, so half the displacement: 93.00 / 84.50
+        // where the default puts it at 96.00 / 87.50.
+        self::assertStringContainsString("1 0.0000 0 1 93.00 84.50 Tm\n(。) Tj", $ops);
+    }
+
+    #[Test]
+    public function the_katakana_middle_dot_is_left_where_it_is(): void
+    {
+        $ops = $this->vertical('本・');
+
+        // Second cell, unshifted: the fonts' own vertical form does not move it.
+        self::assertStringContainsString("1 0.0000 0 1 90.00 81.50 Tm\n(・) Tj", $ops);
     }
 
     #[Test]

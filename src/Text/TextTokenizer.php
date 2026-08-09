@@ -46,6 +46,7 @@ final class TextTokenizer
         . '\\\\(?<esc>.)'                                 // \X  escape
         . '|\[(?<linktext>[^\]]+)\]\((?<url>[^)\s]+)\)'   // [text](url)
         . '|\[(?<attrtext>[^\]]+)\]\{(?<attrs>[^}]*)\}'   // [text]{attrs}
+        . '|\(\((?<note>(?:[^()]|\([^()]*\))+)\)\)'         // ((footnote))
         . '|《《(?<bouten>[^》]+)》》'                       // 《《bouten》》
         . '|\|(?<rp>[^|《\s]+)《(?<rr>[^》]+)》'            // |親《ルビ》
         . '|\{(?<bp>[^|{}]+)\|(?<br>[^}]+)\}'             // {親|ルビ}
@@ -117,6 +118,13 @@ final class TextTokenizer
 
             return;
         }
+        if (self::has($m, 'note')) {
+            // The mark's text is empty until the flow numbers it; only then is
+            // it known what this note is called.
+            $tokens[] = new TextToken('', style: $base, footnote: $m['note'][0]);
+
+            return;
+        }
         if (self::has($m, 'bouten')) {
             $tokens[] = new TextToken($m['bouten'][0], style: $base->with(isBouten: true));
 
@@ -177,6 +185,9 @@ final class TextTokenizer
                 $part === '.bouten' => $style->with(isBouten: true),
                 $part === '.tcy' => $style->with(isTcy: true),
                 $part === '.dropcap' => $style->with(isDropCap: true),
+                $part === '.keepnext' => $style->with(keepWithNext: true),
+                // A subheading is held to what follows it and names the page.
+                $part === '.subhead' => $style->with(keepWithNext: true, isSubheading: true),
                 \str_starts_with($part, 'color=') => $style->with(color: \substr($part, 6)),
                 \str_starts_with($part, 'bg=') => $style->with(backgroundColor: \substr($part, 3)),
                 \str_starts_with($part, 'size=') => $style->with(fontSize: (float) \str_replace('pt', '', \substr($part, 5))),

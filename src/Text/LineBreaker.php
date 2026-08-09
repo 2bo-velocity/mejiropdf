@@ -81,16 +81,38 @@ final readonly class LineBreaker
      */
     public function break(array $tokens, float $maxWidth, float $indent = 0.0, int $indentLines = 0): array
     {
-        if ($tokens === [] || $maxWidth <= 0.0) {
-            return [];
+        $lines = [];
+        foreach ($this->paragraphs($tokens, $maxWidth, $indent, $indentLines) as $paragraph) {
+            foreach ($paragraph as $line) {
+                $lines[] = $line;
+            }
         }
 
-        $lines = [];
+        return $lines;
+    }
+
+    /**
+     * The same line breaking, yielded a paragraph at a time so a caller can
+     * draw and discard each one instead of holding a whole book's lines.
+     *
+     * A paragraph is the unit because it is the largest span any decision here
+     * reaches across — and the same is true of pagination's widow/orphan rules
+     * ({@see Pagination::place()}), so the two stream together.
+     *
+     * @param  list<TextToken> $tokens
+     * @return \Generator<int, list<FormattedLine>>
+     */
+    public function paragraphs(array $tokens, float $maxWidth, float $indent = 0.0, int $indentLines = 0): \Generator
+    {
+        if ($tokens === [] || $maxWidth <= 0.0) {
+            return;
+        }
+
         $lineNo = 0;
         foreach ($this->toSegments($tokens) as $segment) {
             if ($segment === []) {
-                $lines[] = new FormattedLine([], 0.0, isLastInParagraph: true); // blank line from "\n\n"
                 $lineNo++;
+                yield [new FormattedLine([], 0.0, isLastInParagraph: true)]; // blank line from "\n\n"
                 continue;
             }
 
@@ -103,23 +125,24 @@ final readonly class LineBreaker
                 isLastInParagraph: true,
                 indent: $paragraph[$last]->indent,
             );
-            foreach ($paragraph as $line) {
-                $lines[] = $line;
-            }
-        }
 
-        return $lines;
+            yield $paragraph;
+        }
     }
 
     /**
      * Flatten tokens into per-paragraph unit lists, splitting on newlines.
      *
-     * @param  list<TextToken>       $tokens
-     * @return list<list<LineUnit>>
+     * Yielded rather than returned: building every paragraph's units up front
+     * costs memory in proportion to the whole text, which is precisely what
+     * {@see paragraphs()} exists to avoid. A paragraph is emitted as soon as
+     * its newline is seen, so only the one being assembled is held.
+     *
+     * @param  list<TextToken>                 $tokens
+     * @return \Generator<int, list<LineUnit>>
      */
-    private function toSegments(array $tokens): array
+    private function toSegments(array $tokens): \Generator
     {
-        $segments = [];
         $current = [];
         $prev = null;
 
@@ -127,6 +150,27 @@ final readonly class LineBreaker
         foreach ($tokens as $token) {
             if ($token->rubyText !== null) {
                 $unit = $this->rubyUnit($token, $prev);
+                $current[] = $unit;
+                $prev = $unit;
+                continue;
+            }
+
+            // A footnote's mark is one small run that must not be broken from
+            // the word it follows, and it carries the note to whichever page
+            // it lands on.
+            if ($token->footnote !== null) {
+                $size = ($token->style->fontSize ?? $this->fontSize);
+                $unit = new LineUnit(
+                    text: $token->text,
+                    rubyText: null,
+                    style: $token->style,
+                    fontSize: $size,
+                    width: $this->measure($token->text, $size),
+                    canBreakBefore: false,
+                    parentWidth: $this->measure($token->text, $size),
+                    rubyWidth: 0.0,
+                    footnote: $token->footnote,
+                );
                 $current[] = $unit;
                 $prev = $unit;
                 continue;
@@ -145,16 +189,62 @@ final readonly class LineBreaker
             $pieces = \explode("\n", $text);
             foreach ($pieces as $index => $piece) {
                 if ($index > 0) {
-                    $segments[] = $current;
+                    yield $this->spaced($current);
                     $current = [];
                     $prev = null;
                 }
                 $this->emitChars($piece, $token->style, $vertical, $current, $prev);
             }
         }
-        $segments[] = $current;
 
-        return $segments;
+        yield $this->spaced($current);
+    }
+
+    /**
+     * Fill in each unit's gap to its neighbour, once the whole paragraph is
+     * built and every neighbour is therefore known.
+     *
+     * Done here rather than while emitting because a pair can straddle a token
+     * boundary — bold Latin following plain 和字 is two tokens and one seam.
+     *
+     * @param  list<LineUnit> $units
+     * @return list<LineUnit>
+     */
+    private function spaced(array $units): array
+    {
+        if ($this->options->japaneseSpacing === JapaneseSpacing::NONE) {
+            return $units;
+        }
+
+        $last = \count($units) - 1;
+        for ($i = 0; $i < $last; $i++) {
+            $unit = $units[$i];
+            $next = $units[$i + 1];
+            // Runs are compared by the characters that actually touch.
+            $left = \mb_substr($unit->text, -1, 1, 'UTF-8');
+            $right = \mb_substr($next->text, 0, 1, 'UTF-8');
+            $gap = $this->options->japaneseSpacing->between($left, $right) * $unit->fontSize;
+            if ($gap === 0.0) {
+                continue;
+            }
+
+            $units[$i] = new LineUnit(
+                $unit->text,
+                $unit->rubyText,
+                $unit->style,
+                $unit->fontSize,
+                $unit->width,
+                $unit->canBreakBefore,
+                $unit->parentWidth,
+                $unit->rubyWidth,
+                $unit->isTcy,
+                $unit->softHyphen,
+                $unit->isRotatedRun,
+                $gap,
+            );
+        }
+
+        return $units;
     }
 
     /**
@@ -168,6 +258,8 @@ final readonly class LineBreaker
         $chars = \mb_str_split($piece, 1, 'UTF-8');
         $count = \count($chars);
         $autoTcy = $vertical && $this->options->autoTcy;
+
+        $latin = $vertical ? $this->options->latinInVertical : LatinInVertical::UPRIGHT;
 
         $i = 0;
         while ($i < $count) {
@@ -189,6 +281,41 @@ final readonly class LineBreaker
                         $prev = $unit;
                     }
                 }
+                $i = $run;
+                continue;
+            }
+
+            // A run of Latin letters and digits, handled as one decision: the
+            // choice between standing it up, turning it and widening it is
+            // about the run, not about its characters.
+            //
+            // Checked after auto-TCY so the narrower rule keeps its say: a bare
+            // pair of digits stays tate-chu-yoko in every mode, which is what
+            // an author who left `autoTcy` on has already asked for.
+            if ($latin !== LatinInVertical::UPRIGHT && self::isLatin($chars[$i])) {
+                $run = $i;
+                while ($run < $count && self::isLatin($chars[$run])) {
+                    $run++;
+                }
+                $text = \implode('', \array_slice($chars, $i, $run - $i));
+                $length = $run - $i;
+
+                if ($latin === LatinInVertical::FULLWIDTH) {
+                    foreach (\mb_str_split(LatinInVertical::toFullWidth($text), 1, 'UTF-8') as $wide) {
+                        $unit = $this->charUnit($wide, $style, $prev);
+                        $current[] = $unit;
+                        $prev = $unit;
+                    }
+                } elseif ($latin->standsUprightInOneCell($length, $this->options->tcyLimit)) {
+                    $unit = $this->tcyUnit($text, $style, $prev);
+                    $current[] = $unit;
+                    $prev = $unit;
+                } else {
+                    $unit = $this->rotatedRunUnit($text, $style, $prev);
+                    $current[] = $unit;
+                    $prev = $unit;
+                }
+
                 $i = $run;
                 continue;
             }
@@ -215,6 +342,42 @@ final readonly class LineBreaker
             $prev = $unit;
             $i++;
         }
+    }
+
+    /**
+     * A letter or digit of a script that reads sideways in a vertical column.
+     *
+     * Not just ASCII: Greek and Cyrillic run the same way, and Unicode says so
+     * ({@see VerticalOrientation}). Characters the standard leaves upright —
+     * kanji, kana, full-width forms — are excluded, since they are already
+     * cells in their own right.
+     */
+    private static function isLatin(string $char): bool
+    {
+        return \preg_match('/^[\p{L}\p{N}]$/u', $char) === 1
+            && VerticalOrientation::of(\mb_ord($char, 'UTF-8')) !== VerticalOrientation::UPRIGHT_LETTER;
+    }
+
+    /**
+     * A Latin run turned on its side: one unbreakable piece whose advance down
+     * the column is the width it would have had set horizontally.
+     */
+    private function rotatedRunUnit(string $run, TextStyle $style, ?LineUnit $prev): LineUnit
+    {
+        $size = $style->fontSize ?? $this->fontSize;
+        $width = $this->measure($run, $size);
+
+        return new LineUnit(
+            text: $run,
+            rubyText: null,
+            style: $style,
+            fontSize: $size,
+            width: $width,
+            canBreakBefore: $prev !== null,
+            parentWidth: $width,
+            rubyWidth: 0.0,
+            isRotatedRun: true,
+        );
     }
 
     private function tcyUnit(string $run, TextStyle $style, ?LineUnit $prev): LineUnit
@@ -328,7 +491,7 @@ final readonly class LineBreaker
 
             if ($index === $start) {
                 // Always place at least one unit, even if it alone overflows.
-                $width += $unit->width;
+                $width += $unit->width + $unit->spaceAfter;
                 $index++;
                 if ($width > $max) {
                     $lines[] = $this->emit($units, $start, $index, $effIndent);
@@ -339,8 +502,10 @@ final readonly class LineBreaker
                 continue;
             }
 
+            // The candidate's own trailing gap is left out of the test: if it
+            // ends the line the gap is not there to measure.
             if ($width + $unit->width <= $max) {
-                $width += $unit->width;
+                $width += $unit->width + $unit->spaceAfter;
                 $index++;
                 continue;
             }
@@ -471,6 +636,11 @@ final readonly class LineBreaker
         $width = 0.0;
         for ($k = $from; $k < $to; $k++) {
             $width += $units[$k]->width;
+            // The gap after the final unit separates nothing: a line end is
+            // not a place where two characters meet.
+            if ($k < $to - 1) {
+                $width += $units[$k]->spaceAfter;
+            }
         }
 
         return $width;

@@ -63,6 +63,30 @@ final readonly class TypesetterOptions
         public ?TextStyle $baseStyle = null,
         /** Line advance as a multiple of the font size. */
         public float $lineHeight = 1.6,
+        /** What Latin letters and digits do inside a vertical column. */
+        public LatinInVertical $latinInVertical = LatinInVertical::UPRIGHT,
+        /** Longest Latin run set as one upright cell under {@see LatinInVertical::TCY}. */
+        public int $tcyLimit = 2,
+        /** How far the characters that move in a vertical column move. */
+        public VerticalFormStyle $verticalFormStyle = new VerticalFormStyle(),
+        /** Spacing between 和字 and what adjoins it. Off by default. */
+        public JapaneseSpacing $japaneseSpacing = JapaneseSpacing::NONE,
+        /** Lines of the following paragraph a `.keepnext` heading holds on to. */
+        public int $keepWithNextLines = 2,
+        /**
+         * Quantise every line's advance to a whole number of this many points,
+         * so that facing pages put their lines at the same heights. Zero, the
+         * default, leaves the advance alone.
+         *
+         * Measured before it was built: uniform prose already lands on a grid
+         * of its own line advance, because every step is that advance and a
+         * paragraph break is two of them. What breaks it is a line that is
+         * taller than the rest — ruby above all, which threw the pages of a
+         * measured sample 2.2 mm out of step. So this earns its place in books
+         * with furigana or mixed sizes and does nothing at all in the rest,
+         * which is why it is off unless asked for.
+         */
+        public float $lineGrid = 0.0,
     ) {
         if ($minLinesAtPageBreak < 1) {
             throw new \InvalidArgumentException('minLinesAtPageBreak must be at least 1.');
@@ -125,6 +149,12 @@ final readonly class TypesetterOptions
             $this->emphasisMarkStyle,
             $this->baseStyle,
             $this->lineHeight,
+            $this->latinInVertical,
+            $this->tcyLimit,
+            $this->verticalFormStyle,
+            $this->japaneseSpacing,
+            $this->keepWithNextLines,
+            $this->lineGrid,
         );
     }
 
@@ -151,6 +181,12 @@ final readonly class TypesetterOptions
             $this->emphasisMarkStyle,
             $baseStyle,
             $this->lineHeight,
+            $this->latinInVertical,
+            $this->tcyLimit,
+            $this->verticalFormStyle,
+            $this->japaneseSpacing,
+            $this->keepWithNextLines,
+            $this->lineGrid,
         );
     }
 

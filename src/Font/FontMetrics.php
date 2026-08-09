@@ -26,6 +26,8 @@ final class FontMetrics
         return match (true) {
             $font instanceof TrueTypeFont => $font,
             $font instanceof CidFontJapanese => new CidFontMetrics($font),
+            // Same typeface, same advances — only the CMap differs.
+            $font instanceof VerticalCidFont => new CidFontMetrics($font->horizontal),
             $font instanceof StandardFont => new StandardFontMetrics($font),
             default => throw new \LogicException('Unsupported font face: ' . $font::class),
         };

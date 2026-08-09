@@ -34,8 +34,7 @@ final class Typesetter
     private const float ITALIC_SHEAR = 0.2126;      // tan(12°)
     private const float FAUX_BOLD_WIDTH = 0.03;      // × font size
 
-    /** Punctuation shifted to the cell's upper-right in vertical writing. */
-    private const array VERTICAL_UPPER_RIGHT = ['。', '、', '．', '，'];
+
 
     /** Font resource for furigana; set per render() call. */
     private string $rubyResource = '';
@@ -54,6 +53,7 @@ final class Typesetter
 
     public function __construct(
         private readonly TypesetterOptions $options = new TypesetterOptions(),
+        private readonly ?VerticalFaces $vertical = null,
     ) {
     }
 
@@ -97,7 +97,10 @@ final class Typesetter
         $cursorTop = $topY;
         foreach ($lines as $line) {
             $size = $line->isEmpty() ? $baseFontSize : $line->maxFontSize();
-            $rubyExtra = $this->rubyBand($line, $size);
+            // The slack a grid adds belongs above the line, not below it:
+            // that is what puts the baseline itself on the grid rather than
+            // merely the slot it sits in.
+            $rubyExtra = $this->rubyBand($line, $size) + $this->gridSlack($this->rubyBand($line, $size), $size);
             $baseline = $cursorTop - $rubyExtra - $size * 0.8; // 0.8 em ascent
 
             $available = $boxWidth - $line->indent;
@@ -106,7 +109,7 @@ final class Typesetter
             $lastUnit = \count($line->units) - 1;
             foreach ($line->units as $position => $unit) {
                 $ops .= $this->renderUnit($unit, $unitX, $baseline, $fontResource, $encode);
-                $unitX += $unit->width;
+                $unitX += $unit->width + $unit->spaceAfter;
                 if ($position < $lastUnit) {
                     $unitX += $gap;
                 }
@@ -124,7 +127,7 @@ final class Typesetter
                 );
             }
 
-            $cursorTop -= $rubyExtra + $size * $this->options->lineHeight;
+            $cursorTop -= $this->advance($rubyExtra, $size);
         }
 
         return new TypesetResult($ops, $topY - $cursorTop, \count($lines));
@@ -146,21 +149,54 @@ final class Typesetter
         $colRight = $x;
         foreach ($lines as $line) {
             $size = $line->isEmpty() ? $baseFontSize : $line->maxFontSize();
-            $rubyExtra = $this->rubyBand($line, $size);
+            // The slack a grid adds belongs above the line, not below it:
+            // that is what puts the baseline itself on the grid rather than
+            // merely the slot it sits in.
+            $rubyExtra = $this->rubyBand($line, $size) + $this->gridSlack($this->rubyBand($line, $size), $size);
             $centerX = $colRight - $rubyExtra - $size / 2.0;
 
             $gap = $this->justifyGap($line, $boxHeight);
             $top = $topY - ($gap > 0.0 ? 0.0 : $this->alignOffset($line->width, $boxHeight));
             $lastUnit = \count($line->units) - 1;
-            foreach ($line->units as $position => $unit) {
+            $position = 0;
+            while ($position <= $lastUnit) {
+                // Through a vertical CMap, a stretch of plain characters in one
+                // style is a single text object however long it is — the reason
+                // this path exists at all. Anything the CMap cannot carry on its
+                // own (furigana, tate-chu-yoko, a background, emphasis dots,
+                // justification space between cells) ends the stretch.
+                $run = $gap > 0.0 ? 1 : $this->coalescedRun($line->units, $position, $lastUnit);
+                if ($run > 1) {
+                    $first = $line->units[$position];
+                    $text = '';
+                    for ($k = 0; $k < $run; $k++) {
+                        $text .= $line->units[$position + $k]->text;
+                    }
+                    $ops .= $this->verticalRun(
+                        $text,
+                        $centerX,
+                        $top,
+                        $first->fontSize,
+                        $first->style,
+                        self::rgb($first->style->color ?? '#000000'),
+                        (string) $this->vertical?->bodyResource,
+                        $this->verticalBodyEncode(),
+                    );
+                    $top -= $run * $first->width;
+                    $position += $run;
+                    continue;
+                }
+
+                $unit = $line->units[$position];
                 $ops .= $this->renderUnitVertical($unit, $centerX, $top, $colRight, $rubyExtra, $fontResource, $encode);
-                $top -= $unit->width;
+                $top -= $unit->width + $unit->spaceAfter;
                 if ($position < $lastUnit) {
                     $top -= $gap;
                 }
+                $position++;
             }
 
-            $colRight -= $rubyExtra + $size * $this->options->lineHeight;
+            $colRight -= $this->advance($rubyExtra, $size);
         }
 
         return new TypesetResult($ops, $x - $colRight, \count($lines));
@@ -174,8 +210,39 @@ final class Typesetter
     public function lineHeight(FormattedLine $line, float $baseFontSize): float
     {
         $size = $line->isEmpty() ? $baseFontSize : $line->maxFontSize();
+        $band = $this->rubyBand($line, $size);
 
-        return $this->rubyBand($line, $size) + $size * $this->options->lineHeight;
+        return $this->advance($band + $this->gridSlack($band, $size), $size);
+    }
+
+    /**
+     * What one line steps by. Both {@see render()} loops and {@see lineHeight()}
+     * come through here, which is what lets a grid be applied in one place and
+     * keep the planner and the drawing in step — they would otherwise disagree
+     * about where the next line goes.
+     */
+    private function advance(float $rubyExtra, float $size): float
+    {
+        return $rubyExtra + $size * $this->options->lineHeight;
+    }
+
+    /**
+     * How much a grid adds to a line to bring it up to a whole number of steps.
+     *
+     * Up to the next step, never down: a line may be given room it does not
+     * need, but never less than it takes. The tolerance keeps a line that
+     * already measures a whole number of steps from being pushed to the next
+     * one by a rounding bit.
+     */
+    private function gridSlack(float $rubyExtra, float $size): float
+    {
+        $grid = $this->options->lineGrid;
+        if ($grid <= 0.0) {
+            return 0.0;
+        }
+        $advance = $rubyExtra + $size * $this->options->lineHeight;
+
+        return \ceil($advance / $grid - 1.0e-9) * $grid - $advance;
     }
 
     /**
@@ -220,6 +287,9 @@ final class Typesetter
 
     private function renderUnit(LineUnit $unit, float $unitX, float $baseline, string $fontResource, callable $encode): string
     {
+        // A footnote's mark rides above the line it refers from.
+        $baseline += $unit->fontSize * $unit->style->raise;
+
         $size = $unit->fontSize;
         $style = $unit->style;
         $fill = self::rgb($style->color ?? '#000000');
@@ -258,6 +328,31 @@ final class Typesetter
         }
 
         return $ops;
+    }
+
+    /**
+     * The vertical faces a furigana run should use, or nulls when there are
+     * none. Falls back to the vertical body face exactly as
+     * {@see rubyFaceFor()} falls back to the horizontal one, so a ruby face
+     * without the glyphs does not lose its vertical shapes on the way.
+     *
+     * @return array{0: string|null, 1: (callable(string): string)|null}
+     */
+    private function verticalRubyFaceFor(string $text): array
+    {
+        if ($this->vertical === null) {
+            return [null, null];
+        }
+
+        $covers = $this->rubyCovers;
+        if ($covers !== null && !$covers($text)) {
+            /** @var callable(string): string $bodyEncode */
+            $bodyEncode = $this->vertical->bodyEncode;
+
+            return [$this->vertical->bodyResource, $bodyEncode];
+        }
+
+        return $this->vertical->ruby();
     }
 
     /**
@@ -437,6 +532,9 @@ final class Typesetter
         if ($unit->isTcy) {
             return $this->renderTcyCell($unit, $centerX, $top, $fontResource, $encode);
         }
+        if ($unit->isRotatedRun) {
+            return $this->renderRotatedRun($unit, $centerX, $top, $fontResource, $encode);
+        }
 
         $size = $unit->fontSize;
         $style = $unit->style;
@@ -456,7 +554,19 @@ final class Typesetter
 
         // Parent glyphs stacked downward, centred within the unit's advance.
         $parentTop = $top - ($unit->width - $unit->parentWidth) / 2.0;
-        $ops .= $this->stackGlyphs($unit->text, $centerX, $parentTop, $size, $style, $fill, $fontResource, $encode);
+        $ops .= $this->stackGlyphs(
+            $unit->text,
+            $centerX,
+            $parentTop,
+            $size,
+            $style,
+            $fill,
+            $fontResource,
+            $encode,
+            null,
+            $this->vertical?->bodyResource,
+            \is_callable($this->vertical?->bodyEncode) ? $this->vertical->bodyEncode : null,
+        );
 
         if ($unit->rubyText !== null) {
             $rubyStyle = $this->options->rubyStyle;
@@ -481,6 +591,7 @@ final class Typesetter
                 : $rubySize;
 
             [$rubyResource, $rubyEncode] = $this->rubyFaceFor($text);
+            [$rubyVerticalResource, $rubyVerticalEncode] = $this->verticalRubyFaceFor($text);
             $ops .= $this->stackGlyphs(
                 $text,
                 $rubyCenterX,
@@ -491,6 +602,8 @@ final class Typesetter
                 $rubyResource,
                 $rubyEncode,
                 $advance,
+                $rubyVerticalResource,
+                $rubyVerticalEncode,
             );
         }
 
@@ -500,6 +613,111 @@ final class Typesetter
         }
 
         return $ops;
+    }
+
+    /**
+     * How many units starting at $from can be drawn as one vertical text
+     * object: plain, identically styled cells of exactly one em, with nothing
+     * the CMap cannot express on its own.
+     *
+     * @param list<LineUnit> $units
+     */
+    private function coalescedRun(array $units, int $from, int $last): int
+    {
+        if ($this->vertical === null || !$this->isPlainVerticalCell($units[$from])) {
+            return 1;
+        }
+
+        $style = $units[$from]->style;
+        $size = $units[$from]->fontSize;
+        $run = 1;
+        for ($i = $from + 1; $i <= $last; $i++) {
+            $unit = $units[$i];
+            if (!$this->isPlainVerticalCell($unit) || $unit->fontSize !== $size || $unit->style != $style) {
+                break;
+            }
+            $run++;
+        }
+
+        return $run;
+    }
+
+    /**
+     * A cell the vertical CMap can set by itself: one em of advance, no
+     * furigana, no upright run, and no ornament that has to be positioned
+     * against the cell rather than written into it.
+     */
+    private function isPlainVerticalCell(LineUnit $unit): bool
+    {
+        return !$unit->isTcy
+            && $unit->spaceAfter === 0.0
+            && !$unit->isRotatedRun
+            && $unit->rubyText === null
+            && !$unit->style->isBouten
+            && !$unit->style->isUnderline
+            && !$unit->style->isStrikethrough
+            && $unit->style->backgroundColor === null
+            && $unit->width === $unit->fontSize
+            && $unit->parentWidth === $unit->width;
+    }
+
+    /** @return callable(string): string */
+    private function verticalBodyEncode(): callable
+    {
+        if ($this->vertical === null) {
+            return static fn (string $run): string => $run;
+        }
+
+        /** @var callable(string): string $encode */
+        $encode = $this->vertical->bodyEncode;
+
+        return $encode;
+    }
+
+    /**
+     * A Latin run turned on its side, read by tilting the head — the usual
+     * treatment for a word or a URL too long to stand upright in a column.
+     *
+     * The run is drawn as it would be horizontally and then turned a quarter
+     * clockwise, so its natural width becomes its advance down the column and
+     * its baseline sits across the column's centre.
+     *
+     * @param callable(string): string $encode
+     */
+    private function renderRotatedRun(LineUnit $unit, float $centerX, float $top, string $fontResource, callable $encode): string
+    {
+        $size = $unit->fontSize;
+        $style = $unit->style;
+        $fill = self::rgb($style->color ?? '#000000');
+
+        $ops = '';
+        if ($style->backgroundColor !== null) {
+            $ops .= \sprintf(
+                "q\n%s rg\n%.2F %.2F %.2F %.2F re\nf\nQ\n",
+                self::rgb($style->backgroundColor),
+                $centerX - $size / 2.0,
+                $top - $unit->width,
+                $size,
+                $unit->width,
+            );
+        }
+
+        $ops .= "BT\n" . $fill . " rg\n";
+        if ($style->isBold) {
+            $ops .= $fill . " RG\n" . \sprintf("%.2F w\n2 Tr\n", $size * self::FAUX_BOLD_WIDTH);
+        }
+        $ops .= \sprintf('/%s %.2F Tf' . "\n", $fontResource, $size);
+        $ops .= \sprintf(
+            "0 -1 1 0 %.2F %.2F Tm\n%s Tj\n",
+            $centerX - $size * ($this->options->verticalFormStyle->ascent - 0.5),
+            $top,
+            $encode($unit->text),
+        );
+        if ($style->isBold) {
+            $ops .= "0 Tr\n";
+        }
+
+        return $ops . "ET\n";
     }
 
     /**
@@ -548,25 +766,131 @@ final class Typesetter
      *
      * @param callable(string): string $encode
      */
-    private function stackGlyphs(string $text, float $centerX, float $top, float $size, TextStyle $style, string $fill, string $fontResource, callable $encode, ?float $advance = null): string
+    private function stackGlyphs(string $text, float $centerX, float $top, float $size, TextStyle $style, string $fill, string $fontResource, callable $encode, ?float $advance = null, ?string $verticalResource = null, ?callable $verticalEncode = null): string
     {
+        if ($verticalResource !== null && $verticalEncode !== null) {
+            return $this->stackThroughVerticalCmap($text, $centerX, $top, $size, $style, $fill, $verticalResource, $verticalEncode, $advance);
+        }
+
         $step = $advance ?? $size;
         $ops = '';
         $index = 0;
         foreach (\mb_str_split($text, 1, 'UTF-8') as $char) {
-            $x = $centerX - $size / 2.0;
-            $baseline = $top - $index * $step - $size * 0.85;
-            if (\in_array($char, self::VERTICAL_UPPER_RIGHT, true)) {
-                // Full-stop / comma sit at the cell's upper-right in vertical
-                // setting (a positional approximation of the vertical-form glyph).
-                $x += $size * 0.45;
-                $baseline += $size * 0.5;
+            $cellTop = $top - $index * $step;
+            $index++;
+
+            $form = VerticalForm::of($char);
+            if ($form === VerticalForm::ROTATE_90) {
+                $ops .= $this->rotatedGlyph($char, $centerX, $cellTop, $size, $style, $fill, $fontResource, $encode);
+                continue;
             }
-            $ops .= $this->glyph($char, $x, $baseline, $size, $style, $fill, $fontResource, $encode);
+
+            // Upright placement, then whatever the character's class moves it
+            // by: nothing for most, the cell's upper right for a full stop, a
+            // smaller nudge the same way for a small kana.
+            [$dx, $dy] = $form->offset($this->options->verticalFormStyle);
+            $ops .= $this->glyph(
+                $char,
+                $centerX - $size / 2.0 + $size * $dx,
+                $cellTop - $size * $this->options->verticalFormStyle->ascent + $size * $dy,
+                $size,
+                $style,
+                $fill,
+                $fontResource,
+                $encode,
+            );
+        }
+
+        return $ops;
+    }
+
+    /**
+     * A glyph turned a quarter-turn clockwise to stand in for its vertical
+     * form, placed so the turned shape fills the same cell an upright one
+     * would.
+     *
+     * The matrix maps the glyph's advance onto the downward axis and its
+     * ascender onto the rightward one, which puts the em box at
+     * `y ∈ [top − 1em, top]` for `f = top`, and centres it horizontally once
+     * `e` accounts for the baseline sitting a descender's height inside the
+     * box. Italic shear is left off: shearing a rotated glyph slants it across
+     * the column rather than along it.
+     *
+     * @param callable(string): string $encode
+     */
+    private function rotatedGlyph(string $char, float $centerX, float $top, float $size, TextStyle $style, string $fill, string $fontResource, callable $encode): string
+    {
+        $ops = "BT\n" . $fill . " rg\n";
+        if ($style->isBold) {
+            $ops .= $fill . " RG\n" . \sprintf("%.2F w\n2 Tr\n", $size * self::FAUX_BOLD_WIDTH);
+        }
+        $ops .= \sprintf('/%s %.2F Tf' . "\n", $fontResource, $size);
+        $ops .= \sprintf(
+            "0 -1 1 0 %.2F %.2F Tm\n%s Tj\n",
+            // Turned, the box runs from a descender left of the baseline to an
+            // ascender right of it; centring it puts the baseline here.
+            $centerX - $size * ($this->options->verticalFormStyle->ascent - 0.5),
+            $top,
+            $encode($char),
+        );
+        if ($style->isBold) {
+            $ops .= "0 Tr\n";
+        }
+
+        return $ops . "ET\n";
+    }
+
+    /**
+     * Draw a run through a vertical CMap, which knows both the shapes and the
+     * advance: the text position is the top centre of the first cell and each
+     * character steps a full em down by itself.
+     *
+     * A uniform run is therefore one text object, however long the column —
+     * the arrangement that lets a 229-page novel weigh about a kilobyte a page
+     * instead of one text object per character. A run whose characters must be
+     * spread (JIS-spaced furigana over a longer parent) is placed cell by cell
+     * rather than leaning on character spacing, since the run is a few
+     * characters long and the arithmetic is worth less than the certainty.
+     *
+     * @param callable(string): string $encode
+     */
+    private function stackThroughVerticalCmap(string $text, float $centerX, float $top, float $size, TextStyle $style, string $fill, string $fontResource, callable $encode, ?float $advance): string
+    {
+        if ($advance === null || $advance === $size) {
+            return $this->verticalRun($text, $centerX, $top, $size, $style, $fill, $fontResource, $encode);
+        }
+
+        $ops = '';
+        $index = 0;
+        foreach (\mb_str_split($text, 1, 'UTF-8') as $char) {
+            $ops .= $this->verticalRun($char, $centerX, $top - $index * $advance, $size, $style, $fill, $fontResource, $encode);
             $index++;
         }
 
         return $ops;
+    }
+
+    /**
+     * One text object for a vertically-set run. (x, y) is the vertical origin
+     * of the first character — horizontally the centre of the em box, and
+     * vertically its top, which is where Adobe-Japan1's default `DW2` puts it.
+     *
+     * @param callable(string): string $encode
+     */
+    private function verticalRun(string $text, float $centerX, float $top, float $size, TextStyle $style, string $fill, string $fontResource, callable $encode): string
+    {
+        $ops = "BT\n" . $fill . " rg\n";
+        if ($style->isBold) {
+            $ops .= $fill . " RG\n" . \sprintf("%.2F w\n2 Tr\n", $size * self::FAUX_BOLD_WIDTH);
+        }
+        $ops .= \sprintf('/%s %.2F Tf' . "\n", $fontResource, $size);
+        $shear = $style->isItalic ? self::ITALIC_SHEAR : 0.0;
+        $ops .= \sprintf("1 %.4F 0 1 %.2F %.2F Tm\n%s Tj\n", $shear, $centerX, $top, $encode($text));
+        if ($style->isBold) {
+            $ops .= "0 Tr\n";
+        }
+
+        return $ops . "ET\n";
     }
 
     /**
