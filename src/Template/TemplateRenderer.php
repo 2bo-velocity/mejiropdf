@@ -23,6 +23,7 @@ use MejiroPDF\Exception\TemplateException;
 use MejiroPDF\Font\FontMetrics;
 use MejiroPDF\Font\FontFace;
 use MejiroPDF\Font\FontResolver;
+use MejiroPDF\Page\DocumentInfo;
 use MejiroPDF\Page\PageSize;
 use MejiroPDF\Text\LineBreaker;
 use MejiroPDF\Page\Alignment;
@@ -62,6 +63,47 @@ final class TemplateRenderer
     }
 
     /**
+     * The document's properties with `{{ field }}` resolved against the record.
+     *
+     * A template's own name is not the output's title: an invoice is "3 月分
+     * 請求書 — 山田商店", which is only knowable once the record is in hand.
+     * That is the whole reason these hold placeholders rather than being taken
+     * from whatever the designer called the file.
+     *
+     * @param array<string, mixed> $data
+     */
+    private static function documentInfo(CompiledTemplate $template, array $data): DocumentInfo
+    {
+        $resolve = static function (?string $text) use ($data): ?string {
+            if ($text === null) {
+                return null;
+            }
+            $filled = (string) \preg_replace_callback(
+                '/\{\{\s*([^}\s]+)\s*\}\}/u',
+                // A field the record does not carry becomes nothing, as it does
+                // everywhere else in a template: a half-filled title beats
+                // printing the placeholder, and beats refusing the batch.
+                static function (array $m) use ($data): string {
+                    $value = $data[$m[1]] ?? '';
+
+                    return \is_scalar($value) ? (string) $value : '';
+                },
+                $text,
+            );
+            $filled = \trim($filled);
+
+            return $filled === '' ? null : $filled;
+        };
+
+        return new DocumentInfo(
+            title: $resolve($template->document['title'] ?? null),
+            author: $resolve($template->document['author'] ?? null),
+            subject: $resolve($template->document['subject'] ?? null),
+            keywords: $resolve($template->document['keywords'] ?? null),
+        );
+    }
+
+    /**
      * @param array<string, mixed> $data Values for {@see DynamicBinding} keys.
      */
     public function render(Document $document, CompiledTemplate $template, array $data = []): void
@@ -77,9 +119,19 @@ final class TemplateRenderer
             self::assertFits($binding, ElementPainter::valueFor($binding, $data), $document->namedFonts());
         }
 
+        // Before the first page, so a document that is only a template render
+        // still carries its properties even if nothing else is drawn.
+        if ($template->document !== []) {
+            $document->setDocumentInfo(self::documentInfo($template, $data));
+        }
+
         $document->addPage($template->pageSize());
 
-        $this->painter->paint(
+        // The template chose how Japanese and Latin sit together; the painter
+        // that draws its labels and its blocks has to agree.
+        $painter = $this->painter->forTemplate($template);
+
+        $painter->paint(
             $document,
             new ElementSet(
                 texts: $template->texts,
@@ -92,7 +144,7 @@ final class TemplateRenderer
         );
 
         if ($template->blocks !== []) {
-            (new BlockRenderer($this->painter))->render(
+            (new BlockRenderer($painter))->render(
                 $document,
                 $template,
                 $data,

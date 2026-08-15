@@ -19,6 +19,7 @@ namespace MejiroPDF\Template;
 use MejiroPDF\Block\Block;
 use MejiroPDF\Font\TrueTypeFont;
 use MejiroPDF\Page\PageSize;
+use MejiroPDF\Text\JapaneseSpacing;
 
 /**
  * A loaded, ready-to-render compiled template (`.mpb`).
@@ -60,6 +61,22 @@ final readonly class CompiledTemplate
         public float $marginBottom = 0.0,
         public float $marginLeft = 0.0,
         public array $fonts = [],
+        /**
+         * Spacing between Japanese and Latin, chosen by the designer in Studio.
+         * Off unless the template asks: switching it on moves every line break,
+         * so a template built before it existed must keep its measurements.
+         */
+        public JapaneseSpacing $japaneseSpacing = JapaneseSpacing::NONE,
+        /**
+         * The document's own title, author, subject and keywords, as the
+         * designer wrote them — `{{ field }}` and all. They are the *output's*
+         * properties, not the template's name, which is why they are separate
+         * from anything Studio shows in its own title bar. Resolved against the
+         * record at render time.
+         *
+         * @var array{title?: string, author?: string, subject?: string, keywords?: string}
+         */
+        public array $document = [],
     ) {
     }
 

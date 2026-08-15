@@ -84,6 +84,7 @@ use MejiroPDF\Text\Typesetter;
 use MejiroPDF\Text\TypesetterOptions;
 use MejiroPDF\Text\VerticalFaces;
 use MejiroPDF\Text\TypesetResult;
+use MejiroPDF\Text\WritingMode;
 use MejiroPDF\Writer\DocumentWriter;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
@@ -236,6 +237,20 @@ final class Document
     private bool $finalized = false;
 
     /**
+     * Where the last flow left off on the page that is still open, so a chapter
+     * asked to run on can start from there instead of from the region's edge.
+     *
+     * The position is the planner's own coordinate — signed for vertical text,
+     * as {@see FlowRegion::planStart()} gives it — which is why the mode is kept
+     * with it: a value from a flow set the other way round means nothing here.
+     * It is read only when `page` is still the open page, so anything that turns
+     * the leaf discards it without having to say so.
+     *
+     * @var array{page: int, end: float, mode: WritingMode}|null
+     */
+    private ?array $flowCursor = null;
+
+    /**
      * Per-block decisions made by the calling code, keyed by block id.
      *
      * @var array<string, BlockOverride>
@@ -276,7 +291,7 @@ final class Document
         ?LoggerInterface $logger = null,
         private readonly bool $debugGuides = false,
         private readonly bool $strictCanvas = false,
-        private readonly DocumentInfo $info = new DocumentInfo(),
+        private DocumentInfo $info = new DocumentInfo(),
         private readonly ReadingDirection $direction = ReadingDirection::AUTO,
         private readonly OpenFit $openFit = OpenFit::VIEWER_DEFAULT,
     ) {
@@ -413,6 +428,22 @@ final class Document
     public function setDefaultFont(FontFace $font): self
     {
         $this->defaultFont = $font;
+
+        return $this;
+    }
+
+    /**
+     * Replace the document's title, author and the rest, up until output.
+     *
+     * The constructor is the usual place, but a compiled template carries its
+     * own — and the template is not known until it is loaded, which is after
+     * the document exists. Values may hold `{{ field }}` there, so they are
+     * only settled once the record's data is in hand.
+     */
+    public function setDocumentInfo(DocumentInfo $info): self
+    {
+        $this->assertNotFinalized();
+        $this->info = $info;
 
         return $this;
     }
@@ -951,7 +982,42 @@ final class Document
             $pageCursor = $region->planStart();
         }
 
+        if ($lastEnd !== null) {
+            $this->rememberFlowEnd($lastEnd, $region->writingMode);
+        }
+
         return $lastEnd === null ? $region->blockStart : $region->blockAt($lastEnd);
+    }
+
+    /**
+     * Note where a block of text stopped on the page that is still open.
+     *
+     * Only {@see section()} reads this, and only to run a chapter on from where
+     * the last one ended. Everything else addresses the page by coordinate, so
+     * there is deliberately no public cursor to fall out of step with.
+     */
+    private function rememberFlowEnd(float $planned, WritingMode $mode): void
+    {
+        $this->flowCursor = ['page' => $this->pageCount(), 'end' => $planned, 'mode' => $mode];
+    }
+
+    /**
+     * Where a chapter that runs on should start, or null when there is nothing
+     * on this page to run on from.
+     *
+     * A flow set the other way round, or one that ended on a leaf already
+     * turned, says nothing about this region — in both cases the chapter starts
+     * at the region's own edge, exactly as it did before it could run on.
+     */
+    private function flowResumePoint(FlowRegion $region): ?float
+    {
+        $cursor = $this->flowCursor;
+        if ($cursor === null || $cursor['page'] !== $this->pageCount() || $cursor['mode'] !== $region->writingMode) {
+            return null;
+        }
+
+        // Text drawn outside the region cannot push a chapter backwards.
+        return \max($cursor['end'], $region->planStart());
     }
 
     /**
@@ -1589,6 +1655,13 @@ final class Document
      * remains — with the body starting below the heading on this page and at
      * the region's own start on every page after it.
      *
+     * A chapter told not to break ({@see Section::$startsOnNewPage}) starts
+     * from where the last flow on this page stopped, one gap further on, rather
+     * than from the region's edge — otherwise it would be laid over the text
+     * already standing there. Should the heading not fit in what is left, the
+     * page turns after all: a heading is the one thing that must not be broken
+     * or pushed off the sheet.
+     *
      * Returns the block-axis coordinate just past the last line, as
      * {@see flowInto()} does, so anything following knows where the chapter
      * ended.
@@ -1604,10 +1677,33 @@ final class Document
     ): float {
         $font ??= $this->defaultFont;
         $options ??= new TypesetterOptions();
+        $gap = $section->gap * $size * $options->lineHeight / PageSize::MM_TO_PT;
 
         $this->ensurePage();
         if ($section->startsOnNewPage && \strlen($this->content) > $this->blankContentLength) {
             $this->addPage(); // only when this page has already been written on
+        }
+
+        // Where the heading goes, on the planner's axis. A chapter that runs on
+        // resumes a gap past the previous one; one that opens a page — and one
+        // with nothing of its own to follow — starts at the region's edge.
+        $start = $region->planStart();
+        $resume = $section->startsOnNewPage ? null : $this->flowResumePoint($region);
+        if ($resume !== null) {
+            $start = $resume + $gap;
+            $heading = $this->measureTextHeight(
+                $section->title,
+                $region->columnExtent(),
+                $section->titleFont ?? $font,
+                $section->titleSize ?? $size,
+                $options,
+            );
+            // Measured rather than guessed at, because a heading is drawn in one
+            // piece and would otherwise run off the edge of the sheet unnoticed.
+            if ($start + $heading > $region->planLimit()) {
+                $this->addPage();
+                $start = $region->planStart();
+            }
         }
 
         // The heading occupies the first column's first line, then the gap.
@@ -1618,7 +1714,7 @@ final class Document
             \count($this->pages) + 1,
             $this->direction->resolve($this->vertical || $options->writingMode->isVertical()) === 'R2L',
         );
-        [$headX, $headY] = $headingRegion->originAt($headingRegion->planStart());
+        [$headX, $headY] = $headingRegion->originAt($start);
         $consumed = $this->flow(
             $section->title,
             $headX,
@@ -1628,6 +1724,9 @@ final class Document
             $section->titleSize ?? $size,
             $options,
         );
+        // Standing where the heading ends, so a chapter with no body at all
+        // still moves the next one along instead of being written over.
+        $this->rememberFlowEnd($start + $consumed, $region->writingMode);
 
         if ($section->bookmarkLevel !== null) {
             $this->bookmark($section->title, $section->bookmarkLevel);
@@ -1650,7 +1749,10 @@ final class Document
             ];
         }
 
-        $inset = $consumed + $section->gap * $size * $options->lineHeight / PageSize::MM_TO_PT;
+        // Measured from the region's edge, which is where the planner counts
+        // its first page from — so a chapter that ran on carries the distance
+        // it had already travelled as well.
+        $inset = $start - $region->planStart() + $consumed + $gap;
 
         return $this->renderFlow($region, $section->body, $font, $size, $options, $gutter, $inset, $footnotes);
     }

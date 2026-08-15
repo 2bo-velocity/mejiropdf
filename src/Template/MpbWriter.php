@@ -21,6 +21,7 @@ use MejiroPDF\Block\BlockColumn;
 use MejiroPDF\Block\BlockKind;
 use MejiroPDF\Block\ElementSet;
 use MejiroPDF\Font\TrueTypeFont;
+use MejiroPDF\Text\JapaneseSpacing;
 
 /**
  * Serialises a template into `.mpb` (MPBF) bytes.
@@ -41,6 +42,9 @@ final class MpbWriter
      * @param array{top?: float, right?: float, bottom?: float, left?: float} $margin Page margins (mm).
      * @param array<string, TrueTypeFont> $fonts Fonts to carry inside the file, keyed by the name
      *                                           bindings refer to them by.
+     * @param JapaneseSpacing $japaneseSpacing How Japanese and Latin sit together.
+     * @param array{title?: string, author?: string, subject?: string, keywords?: string} $document
+     *        The output's own properties; may hold `{{ field }}`.
      */
     public static function build(
         float $width,
@@ -54,6 +58,8 @@ final class MpbWriter
         array $blocks = [],
         array $margin = [],
         array $fonts = [],
+        JapaneseSpacing $japaneseSpacing = JapaneseSpacing::NONE,
+        array $document = [],
     ): string {
         $bindingMap = [];
         foreach ($bindings as $b) {
@@ -90,6 +96,14 @@ final class MpbWriter
         // the bytes of every template that predates margins.
         if ($margins !== ['top' => 0.0, 'right' => 0.0, 'bottom' => 0.0, 'left' => 0.0]) {
             $payload['margin'] = $margins;
+        }
+        // Solid setting is the absence of the key, for the same reason.
+        if ($japaneseSpacing !== JapaneseSpacing::NONE) {
+            $payload['typography'] = ['japaneseSpacing' => 'jis_x_4051'];
+        }
+        $document = \array_filter($document, static fn (string $v): bool => $v !== '');
+        if ($document !== []) {
+            $payload['document'] = $document;
         }
 
         $json = \json_encode($payload, \JSON_UNESCAPED_UNICODE | \JSON_UNESCAPED_SLASHES);

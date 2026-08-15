@@ -27,24 +27,24 @@ namespace MejiroPDF;
 final class Version
 {
     /** The current release, SemVer `MAJOR.MINOR.PATCH`. */
-    public const string VERSION = '1.2.0';
+    public const string VERSION = '1.3.0';
 
     public const int MAJOR = 1;
-    public const int MINOR = 2;
+    public const int MINOR = 3;
     public const int PATCH = 0;
 
     private function __construct()
     {
     }
 
-    /** The version string, e.g. `"1.2.0"` — for logging and `>=` checks. */
+    /** The version string, e.g. `"1.3.0"` — for logging and `>=` checks. */
     public static function version(): string
     {
         return self::VERSION;
     }
 
     /**
-     * The `/Producer` string embedded in generated PDFs, e.g. `"MejiroPDF 1.2.0"`.
+     * The `/Producer` string embedded in generated PDFs, e.g. `"MejiroPDF 1.3.0"`.
      */
     public static function producer(): string
     {

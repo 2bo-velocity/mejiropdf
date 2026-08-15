@@ -25,6 +25,7 @@ use MejiroPDF\Exception\TemplateException;
 use MejiroPDF\Font\TrueTypeFont;
 use MejiroPDF\Page\Alignment;
 use MejiroPDF\Page\VerticalAlignment;
+use MejiroPDF\Text\JapaneseSpacing;
 
 /**
  * Loads and validates a compiled `.mpb` (MPBF) template.
@@ -105,6 +106,8 @@ final class CompiledTemplateLoader
             marginRight: $payload['margin']['right'],
             marginBottom: $payload['margin']['bottom'],
             marginLeft: $payload['margin']['left'],
+            japaneseSpacing: $payload['japaneseSpacing'],
+            document: $payload['document'],
             fonts: $fonts,
         );
     }
@@ -197,6 +200,8 @@ final class CompiledTemplateLoader
      *     links: list<TemplateLink>,
      *     blocks: list<Block>,
      *     margin: array{top: float, right: float, bottom: float, left: float},
+     *     japaneseSpacing: JapaneseSpacing,
+     *     document: array{title?: string, author?: string, subject?: string, keywords?: string},
      * }
      */
     private static function parsePayload(string $raw): array
@@ -205,6 +210,8 @@ final class CompiledTemplateLoader
             'width' => 0.0, 'height' => 0.0,
             'texts' => [], 'bindings' => [], 'images' => [], 'links' => [], 'blocks' => [],
             'margin' => ['top' => 0.0, 'right' => 0.0, 'bottom' => 0.0, 'left' => 0.0],
+            'japaneseSpacing' => JapaneseSpacing::NONE,
+            'document' => [],
         ];
         if ($raw === '') {
             return $empty;
@@ -249,6 +256,27 @@ final class CompiledTemplateLoader
                 $empty['blocks'][] = $block;
             }
         }
+
+        // Absent in every `.mpb` written before the setting existed, which is
+        // exactly what "solid setting" means — such a template measures as it
+        // always did. An unknown value is treated the same way rather than
+        // refused: a newer Studio must not make a template unreadable.
+        // Absent in every `.mpb` written before document properties existed,
+        // and absent again whenever the designer left the fields empty: there
+        // is nothing to say about a document that says nothing about itself.
+        $document = \is_array($data['document'] ?? null) ? $data['document'] : [];
+        foreach (['title', 'author', 'subject', 'keywords'] as $key) {
+            $value = $document[$key] ?? null;
+            if (\is_string($value) && $value !== '') {
+                $empty['document'][$key] = $value;
+            }
+        }
+
+        $typography = \is_array($data['typography'] ?? null) ? $data['typography'] : [];
+        $empty['japaneseSpacing'] = match ($typography['japaneseSpacing'] ?? null) {
+            'jis_x_4051' => JapaneseSpacing::JIS_X_4051,
+            default => JapaneseSpacing::NONE,
+        };
 
         $margin = \is_array($data['margin'] ?? null) ? $data['margin'] : [];
         foreach (['top', 'right', 'bottom', 'left'] as $side) {

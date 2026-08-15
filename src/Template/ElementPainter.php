@@ -26,6 +26,7 @@ use MejiroPDF\Page\Alignment;
 use MejiroPDF\Page\PageSize;
 use MejiroPDF\Text\TextAlign;
 use MejiroPDF\Text\TextStyle;
+use MejiroPDF\Text\JapaneseSpacing;
 use MejiroPDF\Text\TypesetterOptions;
 
 /**
@@ -43,6 +44,29 @@ use MejiroPDF\Text\TypesetterOptions;
  */
 final class ElementPainter
 {
+    /**
+     * @param JapaneseSpacing $japaneseSpacing Spacing between scripts, as the
+     *                                         template asked for it.
+     */
+    public function __construct(
+        private readonly JapaneseSpacing $japaneseSpacing = JapaneseSpacing::NONE,
+    ) {
+    }
+
+    /**
+     * This painter set up for $template.
+     *
+     * Returns `$this` unless the template asks for something other than the
+     * default, so an injected painter is kept in every case that existed
+     * before templates could ask.
+     */
+    public function forTemplate(CompiledTemplate $template): self
+    {
+        return $template->japaneseSpacing === $this->japaneseSpacing
+            ? $this
+            : new self($template->japaneseSpacing);
+    }
+
     /**
      * Paint one element set with its origin moved to ($dx, $dy) millimetres.
      *
@@ -163,6 +187,7 @@ final class ElementPainter
             enableSmartQuotes: false,
             baseStyle: new TextStyle(isUnderline: $part->underline, color: $part->color),
             lineHeight: $part->lineHeight,
+            japaneseSpacing: $this->japaneseSpacing,
         );
 
         // A single-line part must not wrap, however narrow its box: the Studio

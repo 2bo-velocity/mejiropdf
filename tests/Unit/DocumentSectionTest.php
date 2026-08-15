@@ -12,11 +12,13 @@ declare(strict_types=1);
 namespace MejiroPDF\Tests\Unit;
 
 use MejiroPDF\Document;
+use MejiroPDF\Font\CidFontJapanese;
 use MejiroPDF\Font\StandardFont;
 use MejiroPDF\Layout\FlowRegion;
 use MejiroPDF\Layout\Section;
 use MejiroPDF\Page\CreditOptions;
 use MejiroPDF\Page\RunningHeadOptions;
+use MejiroPDF\Text\TypesetterOptions;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
@@ -37,6 +39,34 @@ final class DocumentSectionTest extends TestCase
     private static function region(): FlowRegion
     {
         return FlowRegion::horizontal(x: 25, topY: 25, width: 160, bottomY: 120);
+    }
+
+    private static function japaneseBody(): string
+    {
+        return \implode("\n\n", \array_fill(0, 2, '　吾輩は猫である。名前はまだ無い。どこで生れたか頓と見当がつかぬ。'));
+    }
+
+    /**
+     * Every point a run of text is set at, kept apart by the stream it belongs
+     * to — the one measurement that shows two chapters written over each other.
+     *
+     * Streams rather than page dictionaries: a page's content is written when
+     * the page is finished, long before the dictionaries are gathered at the
+     * end, so splitting on `/Type /Page` would put every page in one bucket.
+     *
+     * @return list<string>
+     */
+    private static function textOrigins(string $pdf): array
+    {
+        $origins = [];
+        foreach (\explode('endstream', $pdf) as $stream => $part) {
+            \preg_match_all('~1 [-\d.]+ [-\d.]+ 1 ([-\d.]+ [-\d.]+) Tm~', $part, $m);
+            foreach ($m[1] as $point) {
+                $origins[] = $stream . ':' . $point;
+            }
+        }
+
+        return $origins;
     }
 
     #[Test]
@@ -105,6 +135,71 @@ final class DocumentSectionTest extends TestCase
         );
 
         self::assertSame(1, $pdf->pageCount());
+    }
+
+    #[Test]
+    public function a_chapter_that_runs_on_starts_below_the_one_before_it(): void
+    {
+        $pdf = new Document(credit: CreditOptions::disabled());
+        $pdf->addPage();
+        $pdf->section(new Section('One', self::body(1)), self::region(), font: StandardFont::HELVETICA);
+        $second = $pdf->section(
+            new Section('Two', self::body(1), startsOnNewPage: false),
+            self::region(),
+            font: StandardFont::HELVETICA,
+        );
+
+        self::assertSame(1, $pdf->pageCount(), 'Both chapters fit on the one page.');
+        // The whole point: the second chapter is set under the first rather
+        // than over it. Two runs sharing an origin means one is unreadable.
+        $origins = self::textOrigins($pdf->output());
+        self::assertSame($origins, \array_unique($origins), 'No two runs may be drawn at the same point.');
+        self::assertGreaterThan(self::region()->blockStart, $second, 'The second chapter ends below where it began.');
+    }
+
+    #[Test]
+    public function a_chapter_that_runs_on_turns_the_page_when_its_heading_will_not_fit(): void
+    {
+        $pdf = new Document(credit: CreditOptions::disabled());
+        $pdf->addPage();
+        // Ends 14 mm short of the region's foot: room for the gap that follows
+        // it, but not for the gap and a heading both.
+        $pdf->section(new Section('One', self::body(4)), self::region(), font: StandardFont::HELVETICA);
+        $filled = $pdf->pageCount();
+
+        $pdf->section(
+            new Section('Two', self::body(1), gap: 2.0, startsOnNewPage: false),
+            self::region(),
+            font: StandardFont::HELVETICA,
+        );
+
+        self::assertSame($filled + 1, $pdf->pageCount(), 'A heading is never squeezed off the sheet.');
+        $origins = self::textOrigins($pdf->output());
+        self::assertSame($origins, \array_unique($origins));
+    }
+
+    #[Test]
+    public function chapters_run_on_when_set_vertically_too(): void
+    {
+        $pdf = new Document(credit: CreditOptions::disabled());
+        $pdf->setDefaultFont(CidFontJapanese::HEISEI_MIN_W3);
+        $pdf->addPage();
+
+        $region = FlowRegion::vertical(rightX: 190, topY: 25, columnHeight: 120, leftX: 25);
+        $options = TypesetterOptions::novel();
+        $first = true;
+        foreach (['第一章', '第二章', '第三章'] as $title) {
+            $pdf->section(
+                new Section($title, self::japaneseBody(), gap: 3.0, startsOnNewPage: $first),
+                $region,
+                size: 10.0,
+                options: $options,
+            );
+            $first = false;
+        }
+
+        $origins = self::textOrigins($pdf->output());
+        self::assertSame($origins, \array_unique($origins), 'Vertical chapters must not be stacked on one another.');
     }
 
     #[Test]

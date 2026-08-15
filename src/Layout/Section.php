@@ -40,9 +40,15 @@ final readonly class Section
      * @param string        $body            Prose, paragraphs separated by blank lines.
      * @param FontFace|null $titleFont       Defaults to the body's face.
      * @param float|null    $titleSize       Points; defaults to the body size.
-     * @param float         $gap             Clear space between heading and body,
-     *                                       in multiples of the body's line advance.
+     * @param float         $gap             Clear space between heading and body —
+     *                                       and, when the chapter runs on, between
+     *                                       the previous text and the heading — in
+     *                                       multiples of the body's line advance.
      * @param bool          $startsOnNewPage Whether to break before the heading.
+     *                                       `false` runs the chapter on from where
+     *                                       the last flow stopped on this page,
+     *                                       turning the leaf only if the heading
+     *                                       does not fit in what is left.
      * @param int|null      $bookmarkLevel   Outline depth, or null for no bookmark.
      * @param string|null   $runningHead     Overrides {@see $title} in the running
      *                                       head; an empty string suppresses it.
