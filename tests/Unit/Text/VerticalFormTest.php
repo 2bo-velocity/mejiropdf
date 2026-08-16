@@ -41,8 +41,14 @@ final class VerticalFormTest extends TestCase
 
         yield 'ideographic full stop' => ['。', VerticalForm::SHIFT_UPPER_RIGHT];
         yield 'ideographic comma' => ['、', VerticalForm::SHIFT_UPPER_RIGHT];
-        yield 'full-width exclamation' => ['！', VerticalForm::SHIFT_UPPER_RIGHT];
-        yield 'full-width question' => ['？', VerticalForm::SHIFT_UPPER_RIGHT];
+        yield 'full-width comma' => ['，', VerticalForm::SHIFT_UPPER_RIGHT];
+        yield 'full-width full stop' => ['．', VerticalForm::SHIFT_UPPER_RIGHT];
+
+        // `Tu`, like the full stop, but the transform is not a move: four
+        // Japanese faces substitute neither, and both are drawn centred. The
+        // full stop's displacement would put them in the cell above.
+        yield 'full-width exclamation' => ['！', VerticalForm::UPRIGHT];
+        yield 'full-width question' => ['？', VerticalForm::UPRIGHT];
 
         // Half-width punctuation turns rather than moving — its box is half an
         // em, so a full-em displacement would carry it out of its cell. The
@@ -105,8 +111,25 @@ final class VerticalFormTest extends TestCase
     {
         self::assertSame([0.0, 0.0], VerticalForm::UPRIGHT->offset());
         self::assertSame([0.0, 0.0], VerticalForm::ROTATE_90->offset());
-        self::assertSame([0.60, 0.60], VerticalForm::SHIFT_UPPER_RIGHT->offset());
-        self::assertSame([0.15, 0.12], VerticalForm::SHIFT_SMALL_KANA->offset());
+        self::assertSame([0.64, 0.65], VerticalForm::SHIFT_UPPER_RIGHT->offset());
+        self::assertSame([0.12, 0.11], VerticalForm::SHIFT_SMALL_KANA->offset());
+    }
+
+    /**
+     * The one the sample PDFs were reported for: a full-width exclamation mark
+     * set through an embedded TrueType stood two thirds of an em above and to
+     * the right of its column, overlapping the character before it.
+     */
+    #[Test]
+    public function an_exclamation_mark_stays_in_its_cell(): void
+    {
+        foreach (['！', '？'] as $character) {
+            self::assertSame(VerticalForm::UPRIGHT, VerticalForm::of($character));
+            self::assertSame([0.0, 0.0], VerticalForm::of($character)->offset());
+        }
+
+        // …while the character it was being confused with still moves.
+        self::assertNotSame([0.0, 0.0], VerticalForm::of('。')->offset());
     }
 
     #[Test]

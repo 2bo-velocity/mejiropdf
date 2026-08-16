@@ -203,11 +203,11 @@ final class TypesetterTest extends TestCase
             static fn (string $run): string => '(' . $run . ')',
         )->operators;
 
-        // 本 sits centred; 。 moves to the cell's upper right by 0.60 em on both
-        // axes — measured from the vertical forms two Adobe-Japan1 faces
-        // actually draw, where the engine used to guess 0.45 and 0.50.
+        // 本 sits centred; 。 moves to the cell's upper right by 0.64 / 0.65 em
+        // — the mean of the vertical forms four Japanese faces actually draw,
+        // where the engine used to guess 0.45, then 0.60 from two of them.
         self::assertStringContainsString("1 0.0000 0 1 90.00 91.50 Tm\n(本) Tj", $ops);
-        self::assertStringContainsString("1 0.0000 0 1 96.00 87.50 Tm\n(。) Tj", $ops);
+        self::assertStringContainsString("1 0.0000 0 1 96.40 88.00 Tm\n(。) Tj", $ops);
     }
 
     #[Test]
@@ -230,8 +230,24 @@ final class TypesetterTest extends TestCase
 
         // Same size as the character before it — the glyph is already small.
         self::assertSame(2, \substr_count($ops, '/F1 10.00 Tf'));
-        // Up and right by 0.15 / 0.12 em from where an upright glyph would sit.
-        self::assertStringContainsString("1 0.0000 0 1 91.50 82.70 Tm\n(っ) Tj", $ops);
+        // Up and right by 0.12 / 0.11 em from where an upright glyph would sit.
+        self::assertStringContainsString("1 0.0000 0 1 91.20 82.60 Tm\n(っ) Tj", $ops);
+    }
+
+    /**
+     * Reported against generated novels: `！` was being given the full stop's
+     * displacement, which is most of an em, and so left its own cell and
+     * collided with the character above it.
+     */
+    #[Test]
+    public function vertical_exclamation_and_question_marks_stay_centred(): void
+    {
+        $ops = $this->vertical('本！？');
+
+        // Same x as 本, and one whole cell apart — no displacement at all.
+        self::assertStringContainsString("1 0.0000 0 1 90.00 91.50 Tm\n(本) Tj", $ops);
+        self::assertStringContainsString("1 0.0000 0 1 90.00 81.50 Tm\n(！) Tj", $ops);
+        self::assertStringContainsString("1 0.0000 0 1 90.00 71.50 Tm\n(？) Tj", $ops);
     }
 
     #[Test]

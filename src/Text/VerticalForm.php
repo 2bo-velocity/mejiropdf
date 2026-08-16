@@ -34,6 +34,10 @@ namespace MejiroPDF\Text;
  * than one project's reading of three sample files. How *far* the moving ones
  * move is a separate question, answered by {@see VerticalFormStyle}.
  *
+ * The property does have one gap this has to fill: `Tu` says a character has a
+ * distinct vertical form without saying that form sits anywhere else in the em
+ * box, and for two characters it does not ({@see CENTRED_IN_CELL}).
+ *
  * **It remains an approximation.** Measuring two Adobe-Japan1 faces shows
  * `（` `）` and `ー` do fall out of a plain rotation, but `「` and `」` do not:
  * their vertical shapes are drawn, not turned. Rotation gets close and never
@@ -53,9 +57,45 @@ enum VerticalForm
     /** Same shape and size, nudged up and right: the small kana. */
     case SHIFT_SMALL_KANA;
 
+    /**
+     * `Tu` characters whose vertical form is not a displacement.
+     *
+     * The property says a character has a distinct upright vertical form; it
+     * does not say the form sits anywhere else in the em box. For the comma
+     * and full stop it does — that is the whole reason {@see
+     * SHIFT_UPPER_RIGHT} exists — but the full-width exclamation and question
+     * marks are `Tu` while, in Japanese, their vertical form is the horizontal
+     * one. Following `vert` through IPAex Mincho, IPAex Gothic, Noto Serif CJK
+     * JP and Noto Sans CJK JP substitutes neither of them, and both are drawn
+     * centred already (`！` inks 895–1153 of IPAex Mincho's 2048-unit em, so
+     * its centre is the em's to the unit). Moving them the two thirds of an em
+     * a full stop wants carries them clear of their own cell and into the one
+     * above — which is what a vertical column set through an embedded TrueType
+     * used to show.
+     *
+     * **The two Noto faces do move them, but only under `ZHS` and `KOR`.** The
+     * Japanese language system leaves them alone, and so does the default one.
+     * Anyone later teaching the engine to read `vert` from the face itself has
+     * to read it per language system, or it will reintroduce this by taking
+     * the Simplified Chinese answer for a Japanese page.
+     *
+     * The same reasoning already excludes the squared abbreviations, which are
+     * `Tu` because a different glyph is drawn rather than the same one moved.
+     * That case falls out of the table, this one has to be named.
+     *
+     * @var list<int>
+     */
+    private const array CENTRED_IN_CELL = [0xFF01, 0xFF1F];
+
     public static function of(string $character): self
     {
-        return match (VerticalOrientation::of(\mb_ord($character, 'UTF-8'))) {
+        $codePoint = \mb_ord($character, 'UTF-8');
+
+        if (\in_array($codePoint, self::CENTRED_IN_CELL, true)) {
+            return self::UPRIGHT;
+        }
+
+        return match (VerticalOrientation::of($codePoint)) {
             VerticalOrientation::ROTATE => self::ROTATE_90,
             VerticalOrientation::SHIFT => self::SHIFT_UPPER_RIGHT,
             VerticalOrientation::SMALL_KANA => self::SHIFT_SMALL_KANA,
