@@ -67,6 +67,11 @@ final class JpegImage implements RasterImage
                 $height = (\ord($data[$i + 3]) << 8) | \ord($data[$i + 4]);
                 $width = (\ord($data[$i + 5]) << 8) | \ord($data[$i + 6]);
                 $components = \ord($data[$i + 7]);
+                if ($width < 1 || $height < 1) {
+                    // A height of 0 is legal JPEG (DNL defines it later) but
+                    // leaves nothing to scale a placement by.
+                    throw ImageException::invalid("JPEG has no declared area ({$width} x {$height}).");
+                }
 
                 $colorSpace = match ($components) {
                     1 => '/DeviceGray',

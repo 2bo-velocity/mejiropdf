@@ -69,6 +69,27 @@ final class SignatureVerificationTest extends TestCase
     }
 
     #[Test]
+    public function page_text_that_mimics_the_placeholders_does_not_capture_the_signature(): void
+    {
+        // Content streams are uncompressed, and the literal-string escaper
+        // leaves "/" and "<" alone, so this reaches the file verbatim — ahead
+        // of the /Sig dictionary. The signature used to be spliced in at the
+        // first "/Contents <", overwriting the page that followed it.
+        [$content, $der] = $this->signAndSplit(
+            'Customer: /Contents <0000> [0 0000000000 0000000000 0000000000]',
+        );
+
+        self::assertStringContainsString('Customer: /Contents <0000> [0 0000000000 0000000000 0000000000]', $content);
+
+        [$code] = $this->runCommand(\sprintf(
+            'openssl cms -verify -inform DER -in %s -content %s -binary -noverify -out /dev/null',
+            \escapeshellarg($this->tempFile($der)),
+            \escapeshellarg($this->tempFile($content)),
+        ));
+        self::assertSame(0, $code, 'The signature must still cover the document when page text mimics its placeholders.');
+    }
+
+    #[Test]
     public function tampering_with_the_signed_bytes_breaks_verification(): void
     {
         [$content, $der] = $this->signAndSplit();
@@ -93,11 +114,11 @@ final class SignatureVerificationTest extends TestCase
      *
      * @return array{string, string} [signed content, DER signature]
      */
-    private function signAndSplit(): array
+    private function signAndSplit(string $text = 'Integration-signed document'): array
     {
         $signature = Signature::fromFiles(self::CERT, self::KEY, name: 'MejiroPDF Test Signer', reason: 'Approval');
         $pdf = new Document(credit: CreditOptions::disabled(), signature: $signature);
-        $pdf->addPage()->text(20, 30, 'Integration-signed document');
+        $pdf->addPage()->text(20, 30, $text);
         $out = $pdf->output();
 
         if (\preg_match('~/ByteRange \[(\d+) (\d+) (\d+) (\d+)\]~', $out, $m) !== 1) {

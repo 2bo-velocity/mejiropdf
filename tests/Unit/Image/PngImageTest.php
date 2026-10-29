@@ -78,4 +78,83 @@ final class PngImageTest extends TestCase
 
         PngImage::fromString('nope');
     }
+
+    /**
+     * A minimal PNG: signature, IHDR, one IDAT holding $pixels compressed,
+     * IEND.
+     */
+    private static function png(int $width, int $height, int $colorType, string $pixels): string
+    {
+        $chunk = static fn (string $type, string $data): string
+            => \pack('N', \strlen($data)) . $type . $data . \pack('N', \crc32($type . $data));
+
+        return "\x89PNG\r\n\x1A\n"
+            . $chunk('IHDR', \pack('NNCCCCC', $width, $height, 8, $colorType, 0, 0, 0))
+            . $chunk('IDAT', (string) \gzcompress($pixels))
+            . $chunk('IEND', '');
+    }
+
+    private static function embedBytes(string $png): void
+    {
+        $stream = \fopen('php://temp', 'r+b');
+        self::assertIsResource($stream);
+        PngImage::fromString($png)->embed(new DocumentWriter(new SafeStreamWriter($stream)));
+    }
+
+    #[Test]
+    public function an_image_with_no_area_is_refused(): void
+    {
+        // Used to reach Document::image() and divide by its zero width.
+        $this->expectException(ImageException::class);
+
+        PngImage::fromString(self::png(0, 0, 2, ''));
+    }
+
+    #[Test]
+    public function alpha_data_shorter_than_its_header_promises_is_refused_quickly(): void
+    {
+        // A few dozen bytes claiming 4000 x 4000 RGBA — under the decode
+        // ceiling, so the length check is what refuses it. Without that check
+        // the rows were unfiltered one by one over data that is not there.
+        $start = \microtime(true);
+        try {
+            self::embedBytes(self::png(4000, 4000, 6, "\0\0\0\0\0"));
+            self::fail('Truncated alpha data must be refused.');
+        } catch (ImageException $e) {
+            self::assertSame('MP-IMG-5002', $e->getErrorCode());
+        }
+        self::assertLessThan(2.0, \microtime(true) - $start);
+    }
+
+    #[Test]
+    public function alpha_data_longer_than_its_header_promises_is_refused(): void
+    {
+        $this->expectException(ImageException::class);
+
+        // One 1 x 1 RGBA row is 5 bytes (filter byte + 4 samples); give it 6.
+        self::embedBytes(self::png(1, 1, 6, "\0\1\2\3\4\5"));
+    }
+
+    #[Test]
+    public function alpha_images_beyond_the_decode_ceiling_are_refused_before_inflating(): void
+    {
+        $start = \microtime(true);
+        try {
+            self::embedBytes(self::png(50000, 50000, 6, "\0"));
+            self::fail('An alpha image beyond the decode ceiling must be refused.');
+        } catch (ImageException $e) {
+            self::assertSame('MP-IMG-5001', $e->getErrorCode());
+        }
+        self::assertLessThan(1.0, \microtime(true) - $start);
+    }
+
+    #[Test]
+    public function well_formed_alpha_data_built_in_place_still_embeds(): void
+    {
+        // Two rows of 2 x RGBA, filter "none".
+        $rows = "\0" . \str_repeat("\xFF\x00\x00\x80", 2) . "\0" . \str_repeat("\x00\xFF\x00\xFF", 2);
+        self::embedBytes(self::png(2, 2, 6, $rows));
+
+        $this->addToAssertionCount(1); // no exception
+    }
 }

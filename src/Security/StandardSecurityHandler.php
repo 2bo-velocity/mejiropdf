@@ -48,7 +48,15 @@ final class StandardSecurityHandler
         $documentId = \random_bytes(16);
 
         $userPadded = \substr($encryption->userPassword . self::PAD, 0, 32);
-        $ownerSource = $encryption->ownerPassword !== '' ? $encryption->ownerPassword : $encryption->userPassword;
+        // No owner password means "nobody may lift the restrictions", not
+        // "the user password lifts them": a viewer given a password that
+        // matches the owner entry grants every permission, so reusing the user
+        // password would hand that to everyone who can open the file, and
+        // leaving it empty would hand it to everyone at all. A random one that
+        // is never recorded makes the permissions binding.
+        $ownerSource = $encryption->ownerPassword !== ''
+            ? $encryption->ownerPassword
+            : \bin2hex(\random_bytes(16));
         $ownerPadded = \substr($ownerSource . self::PAD, 0, 32);
 
         // /O entry (Algorithm 3).

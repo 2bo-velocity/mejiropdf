@@ -27,6 +27,12 @@ use MejiroPDF\Writer\DocumentWriter;
  * /DecodeParms /Predictor 15. Images with an alpha channel are decoded, the
  * colour and alpha are split, and the alpha becomes a grayscale /SMask.
  * Interlaced PNGs are not supported.
+ *
+ * The header is not trusted: an image is refused when it has no area, and the
+ * alpha path — the only one that decodes pixels in PHP — checks the inflated
+ * data against the size the header claims, and that size against
+ * {@see MAX_DECODED_BYTES}, before touching a single row. Otherwise a few dozen
+ * bytes claiming 50000 × 50000 would keep a worker busy indefinitely.
  */
 final class PngImage implements RasterImage
 {
@@ -35,6 +41,14 @@ final class PngImage implements RasterImage
     private const int PALETTE = 3;
     private const int GRAY_ALPHA = 4;
     private const int RGBA = 6;
+
+    /**
+     * Largest decoded size (filter bytes included) accepted for an image with
+     * an alpha channel, whose pixels have to be split in PHP. 256 MiB is an
+     * 8192 × 8192 RGBA image; opaque images are passed through undecoded and
+     * are not subject to it.
+     */
+    public const int MAX_DECODED_BYTES = 256 * 1024 * 1024;
 
     private function __construct(
         private readonly int $width,
@@ -82,6 +96,9 @@ final class PngImage implements RasterImage
         $colorType = \ord($ihdr[9]);
         $interlace = \ord($ihdr[12]);
 
+        if ($width < 1 || $height < 1) {
+            throw ImageException::invalid("PNG has no area ({$width} x {$height}).");
+        }
         if ($interlace !== 0) {
             throw ImageException::unsupported('Interlaced PNG is not supported.');
         }
@@ -151,9 +168,22 @@ final class PngImage implements RasterImage
         $channels = $this->colorType === self::RGBA ? 3 : 1;
         $bpp = $channels + 1;
 
-        $raw = \gzuncompress($this->idat);
-        if ($raw === false) {
-            throw ImageException::invalid('PNG image data could not be inflated.');
+        // One filter byte per row, then the samples.
+        $expected = $this->height * ($this->width * $bpp + 1);
+        if ($expected > self::MAX_DECODED_BYTES) {
+            throw ImageException::unsupported(\sprintf(
+                'PNG with alpha decodes to %d bytes, above the %d this engine will decode.',
+                $expected,
+                self::MAX_DECODED_BYTES,
+            ));
+        }
+        $raw = self::inflate($this->idat, $expected);
+        if (\strlen($raw) !== $expected) {
+            throw ImageException::invalid(\sprintf(
+                'PNG image data inflates to %d bytes; its header promises %d.',
+                \strlen($raw),
+                $expected,
+            ));
         }
         $raw = $this->unfilter($raw, $bpp);
 
@@ -236,6 +266,32 @@ final class PngImage implements RasterImage
         $hival = \intdiv(\strlen($this->palette), 3) - 1;
 
         return \sprintf('[ /Indexed /DeviceRGB %d < %s > ]', $hival, \strtoupper(\bin2hex($this->palette)));
+    }
+
+    /**
+     * Inflate until the output passes $limit, then stop: enough to tell a
+     * stream of the right size from a longer one, without letting it run on.
+     */
+    private static function inflate(string $data, int $limit): string
+    {
+        $context = \inflate_init(\ZLIB_ENCODING_DEFLATE);
+        if ($context === false) {
+            throw ImageException::invalid('PNG image data could not be inflated.');
+        }
+
+        $out = '';
+        foreach (\str_split($data, 8192) as $chunk) {
+            $piece = @\inflate_add($context, $chunk, \ZLIB_SYNC_FLUSH);
+            if ($piece === false) {
+                throw ImageException::invalid('PNG image data could not be inflated.');
+            }
+            $out .= $piece;
+            if (\strlen($out) > $limit || \inflate_get_status($context) === \ZLIB_STREAM_END) {
+                break;
+            }
+        }
+
+        return $out;
     }
 
     private static function deflate(string $data): string

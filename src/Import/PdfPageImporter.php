@@ -25,10 +25,32 @@ namespace MejiroPDF\Import;
  * (ObjStm). Content filtered with FlateDecode is inflated. Encrypted sources
  * raise a {@see PdfImportException}.
  *
+ * The source is treated as hostile: it is typically a file someone uploaded.
+ * Every count, length and reference it declares is checked against what the
+ * file can actually hold before it is acted on, decompression is capped by
+ * {@see MAX_INFLATED_BYTES}, and the page tree and object streams are walked
+ * so that no node is visited twice. A malformed file raises MP-VAL-1004 rather
+ * than exhausting memory, spinning, or recursing until the stack runs out.
+ *
  * @phpstan-type Location array{t: int, offset?: int, stm?: int, idx?: int}
  */
 final class PdfPageImporter
 {
+    /**
+     * Ceiling on the bytes decompressed from one source, across all of its
+     * streams. Only cross-reference streams, object streams and the imported
+     * page's content are inflated (images and fonts are copied compressed), so
+     * a real page stays far below this; a few hundred bytes of Flate data, on
+     * the other hand, can claim a gigabyte.
+     */
+    public const int MAX_INFLATED_BYTES = 64 * 1024 * 1024;
+
+    /** Size of a classic cross-reference entry, in bytes. */
+    private const int XREF_ENTRY_LENGTH = 20;
+
+    /** Inflated bytes still allowed under {@see MAX_INFLATED_BYTES}. */
+    private int $inflateBudget = self::MAX_INFLATED_BYTES;
+
     /** @var array<int, array{t: int, offset?: int, stm?: int, idx?: int}> object number => location */
     private array $locations = [];
 
@@ -160,12 +182,18 @@ final class PdfPageImporter
             $start = (int) ($header[0] ?? 0);
             $count = (int) ($header[1] ?? 0);
             $p = $eol + 1;
+            // Each entry is a fixed 20 bytes, so the file itself bounds how
+            // many a subsection can hold; a header claiming more would
+            // otherwise loop for as long as it likes over nothing.
+            if ($count < 0 || $start < 0 || $count > \intdiv(\strlen($this->pdf) - $p, self::XREF_ENTRY_LENGTH)) {
+                throw PdfImportException::invalid(\sprintf('Cross-reference subsection claims %d entries the file cannot hold.', $count));
+            }
             for ($i = 0; $i < $count; $i++) {
                 $entry = \substr($this->pdf, $p, 20);
                 if (($entry[17] ?? 'f') === 'n' && !isset($this->locations[$start + $i])) {
                     $this->locations[$start + $i] = ['t' => 1, 'offset' => (int) \substr($entry, 0, 10)];
                 }
-                $p += 20;
+                $p += self::XREF_ENTRY_LENGTH;
             }
             while ($p < \strlen($this->pdf) && \ctype_space($this->pdf[$p])) {
                 $p++;
@@ -197,8 +225,7 @@ final class PdfPageImporter
         $this->lastTrailerDict = $dict;
 
         if (\str_contains($dict, '/FlateDecode')) {
-            $inflated = \gzuncompress($stream);
-            $stream = $inflated === false ? $stream : $inflated;
+            $stream = $this->inflate($stream);
         }
         $stream = $this->applyPredictor($stream, $dict);
 
@@ -259,6 +286,11 @@ final class PdfPageImporter
             return $data;
         }
         $columns = \preg_match('/\/Columns\s+(\d+)/', $dict, $cm) === 1 ? (int) $cm[1] : 1;
+        // A row wider than the data holds no row at all; refusing it here keeps
+        // the zero-filled "previous row" from being sized by the claim alone.
+        if ($columns < 1 || $columns >= \strlen($data)) {
+            return '';
+        }
 
         $out = '';
         $prev = \str_repeat("\x00", $columns);
@@ -310,6 +342,9 @@ final class PdfPageImporter
      */
     private function parseObjectAt(int $offset): array
     {
+        if ($offset < 0 || $offset >= \strlen($this->pdf)) {
+            throw PdfImportException::invalid("Object offset {$offset} lies outside the file.");
+        }
         $objPos = \strpos($this->pdf, 'obj', $offset);
         if ($objPos === false) {
             throw PdfImportException::invalid('Object has no \'obj\' keyword.');
@@ -335,6 +370,12 @@ final class PdfPageImporter
     private function objectFromStream(int $streamNumber, int $index): string
     {
         if (!isset($this->objStmCache[$streamNumber])) {
+            // An object stream may not itself live in an object stream (PDF
+            // 32000-1 §7.5.7). Holding sources to that is also what keeps a
+            // stream that claims to contain itself from recursing forever.
+            if (($this->locations[$streamNumber]['t'] ?? null) !== 1) {
+                throw PdfImportException::invalid("Object stream {$streamNumber} is not a top-level object.");
+            }
             $this->objStmCache[$streamNumber] = $this->parseObjectStream($streamNumber);
         }
 
@@ -352,14 +393,18 @@ final class PdfPageImporter
             throw PdfImportException::invalid("Object stream {$streamNumber} has no data.");
         }
         if (\str_contains($dict, '/FlateDecode')) {
-            $inflated = \gzuncompress($stream);
-            $stream = $inflated === false ? $stream : $inflated;
+            $stream = $this->inflate($stream);
         }
 
         $count = \preg_match('/\/N\s+(\d+)/', $dict, $nm) === 1 ? (int) $nm[1] : 0;
         $first = \preg_match('/\/First\s+(\d+)/', $dict, $fm) === 1 ? (int) $fm[1] : 0;
 
         $header = \array_map('intval', \preg_split('/\s+/', \trim(\substr($stream, 0, $first))) ?: []);
+        // The header lists a number/offset pair per object, so /N can be no
+        // larger than what the header actually carries.
+        if ($count < 0 || $count * 2 > \count($header)) {
+            throw PdfImportException::invalid(\sprintf('Object stream %d claims %d objects but indexes %d.', $streamNumber, $count, \intdiv(\count($header), 2)));
+        }
         $objects = [];
         for ($i = 0; $i < $count; $i++) {
             $start = $first + ($header[$i * 2 + 1] ?? 0);
@@ -375,6 +420,7 @@ final class PdfPageImporter
     /**
      * @param  string|null $inheritedResources raw /Resources value inherited from an ancestor node
      * @param  int         $inheritedRotate    /Rotate inherited from an ancestor node
+     * @param  array<int, true> $visited      every node already walked
      * @return list<array{string, string, string|null, int}> [pageDict, mediaBox, resourcesValue, rotate]
      */
     private function collectPages(
@@ -383,10 +429,18 @@ final class PdfPageImporter
         ?string $inheritedResources,
         int $inheritedRotate,
         int $depth,
+        array &$visited = [],
     ): array {
         if ($depth > 50) {
             throw PdfImportException::invalid('Page tree nesting too deep.');
         }
+        // The page tree is a tree: no node has two parents. Without this a
+        // node listing the same child twice at every level doubles the walk
+        // per level, and 40 levels of a few kilobytes become 2^40 pages.
+        if (isset($visited[$node])) {
+            throw PdfImportException::invalid("Page tree reaches object {$node} more than once.");
+        }
+        $visited[$node] = true;
         [$dict] = $this->object($node);
         $box = $this->mediaBox($dict) ?? $inheritedBox;
         // /Resources and /Rotate are both inheritable attributes (PDF 32000-1
@@ -399,7 +453,7 @@ final class PdfPageImporter
             $pages = [];
             \preg_match_all('/(\d+)\s+\d+\s+R/', $this->arrayValue($dict, 'Kids'), $kids);
             foreach ($kids[1] as $kid) {
-                foreach ($this->collectPages((int) $kid, $box, $resources, $rotate, $depth + 1) as $page) {
+                foreach ($this->collectPages((int) $kid, $box, $resources, $rotate, $depth + 1, $visited) as $page) {
                     $pages[] = $page;
                 }
             }
@@ -420,8 +474,7 @@ final class PdfPageImporter
                 continue;
             }
             if (\str_contains($dict, '/FlateDecode')) {
-                $inflated = \gzuncompress($stream);
-                $stream = $inflated === false ? $stream : $inflated;
+                $stream = $this->inflate($stream);
             }
             $content .= $stream . "\n";
         }
@@ -529,6 +582,43 @@ final class PdfPageImporter
         }
 
         return $value;
+    }
+
+    /**
+     * Inflate a FlateDecode stream within the remaining budget.
+     *
+     * Decoded incrementally so that a stream breaching the budget is stopped
+     * as it grows rather than after it has been fully allocated. Data that is
+     * not valid zlib is returned as is, as it always was: some producers flag
+     * streams they never compressed, and the caller copes with raw bytes.
+     */
+    private function inflate(string $data): string
+    {
+        $context = \inflate_init(\ZLIB_ENCODING_DEFLATE);
+        if ($context === false) {
+            return $data;
+        }
+
+        $out = '';
+        foreach (\str_split($data, 8192) as $chunk) {
+            $piece = @\inflate_add($context, $chunk, \ZLIB_SYNC_FLUSH);
+            if ($piece === false) {
+                return $data;
+            }
+            $out .= $piece;
+            if (\strlen($out) > $this->inflateBudget) {
+                throw PdfImportException::unsupported(\sprintf(
+                    'Source decompresses to more than %d bytes.',
+                    self::MAX_INFLATED_BYTES,
+                ));
+            }
+            if (\inflate_get_status($context) === \ZLIB_STREAM_END) {
+                break;
+            }
+        }
+        $this->inflateBudget -= \strlen($out);
+
+        return $out;
     }
 
     private function paeth(int $a, int $b, int $c): int

@@ -71,4 +71,15 @@ final class JpegImageTest extends TestCase
 
         JpegImage::fromString('not a jpeg at all');
     }
+
+    #[Test]
+    public function a_frame_with_no_area_is_refused(): void
+    {
+        // SOI, then an SOF0 declaring 8-bit, 0 x 0, 3 components.
+        $jpeg = "\xFF\xD8\xFF\xC0\x00\x11\x08\x00\x00\x00\x00\x03" . \str_repeat("\x00", 9);
+
+        $this->expectException(ImageException::class);
+
+        JpegImage::fromString($jpeg);
+    }
 }

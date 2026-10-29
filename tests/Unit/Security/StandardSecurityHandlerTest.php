@@ -71,4 +71,46 @@ final class StandardSecurityHandlerTest extends TestCase
         self::assertNotSame(Encryption::ALLOW_ALL, Encryption::NO_PRINT);
         self::assertNotSame(Encryption::ALLOW_ALL, Encryption::NO_COPY);
     }
+
+    /** The /O entry, which depends only on the two passwords (Algorithm 3). */
+    private static function ownerEntry(Encryption $encryption): string
+    {
+        $dictionary = StandardSecurityHandler::fromEncryption($encryption)->encryptionDictionary();
+        if (\preg_match('~/O <([0-9a-f]{64})>~', $dictionary, $m) !== 1) {
+            self::fail('No /O entry in the encryption dictionary.');
+        }
+
+        return $m[1];
+    }
+
+    #[Test]
+    public function an_empty_owner_password_is_not_the_user_password(): void
+    {
+        // A viewer grants every permission to whoever supplies the owner
+        // password. Falling back to the user password made a "no printing"
+        // restriction void for everyone able to open the file.
+        self::assertNotSame(
+            self::ownerEntry(new Encryption('secret', 'secret', Encryption::NO_PRINT)),
+            self::ownerEntry(new Encryption('secret', '', Encryption::NO_PRINT)),
+        );
+    }
+
+    #[Test]
+    public function an_empty_owner_password_is_a_fresh_random_one(): void
+    {
+        // Both empty used to make the owner password the empty string, which
+        // every viewer tries first: the permissions bound nobody.
+        $first = self::ownerEntry(new Encryption('', '', Encryption::NO_COPY));
+
+        self::assertNotSame($first, self::ownerEntry(new Encryption('', '', Encryption::NO_COPY)));
+    }
+
+    #[Test]
+    public function an_explicit_owner_password_stays_deterministic(): void
+    {
+        self::assertSame(
+            self::ownerEntry(new Encryption('secret', 'owner')),
+            self::ownerEntry(new Encryption('secret', 'owner')),
+        );
+    }
 }

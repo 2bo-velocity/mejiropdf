@@ -142,6 +142,9 @@ final class Document
     /** How many text lines a drop cap spans (and indents beside). */
     private const int DROP_CAP_LINES = 3;
 
+    /** The /ByteRange a signature dictionary carries until the file is complete. */
+    private const string SIG_BYTE_RANGE_PLACEHOLDER = '[0 0000000000 0000000000 0000000000]';
+
     /** @var list<array{kind: string, rect: string, url: string, target: int}> Annotations for the open page. */
     private array $pendingAnnots = [];
 
@@ -264,6 +267,15 @@ final class Document
     private int $sigWidgetId = 0;
     private int $sigDictId = 0;
     private bool $sigWidgetPlaced = false;
+
+    /**
+     * Byte offsets, in the finished file, of the /Sig dictionary's /ByteRange
+     * placeholder and of the `<` opening its /Contents placeholder. Recorded
+     * as they are written, because searching for them afterwards finds the
+     * first look-alike instead — and page text is free to contain one.
+     */
+    private int $sigByteRangeOffset = -1;
+    private int $sigContentsOffset = -1;
 
     /**
      * @param LoggerInterface|null $logger       Any PSR-3 logger — the host's Monolog
@@ -4107,13 +4119,18 @@ final class Document
             $meta .= \sprintf(' /ContactInfo (%s)', PdfEscaper::literal($signature->contactInfo));
         }
 
-        $placeholder = \str_repeat('0', $signature->reservedBytes * 2);
-        $this->doc->writeObject($this->sigDictId, \sprintf(
-            '<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached %s '
-            . '/ByteRange [0 0000000000 0000000000 0000000000] /Contents <%s> >>',
-            $meta,
-            $placeholder,
-        ));
+        // The placeholders go last, after the signer's own strings, so their
+        // positions follow from the length of what precedes them.
+        $head = \sprintf('<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached %s /ByteRange ', $meta);
+        $body = $head . self::SIG_BYTE_RANGE_PLACEHOLDER . ' /Contents <'
+            . \str_repeat('0', $signature->reservedBytes * 2) . '> >>';
+
+        // writeObject() emits "N 0 obj\n" and then the body.
+        $bodyOffset = $this->writer->getOffset() + \strlen("{$this->sigDictId} 0 obj\n");
+        $this->sigByteRangeOffset = $bodyOffset + \strlen($head);
+        $this->sigContentsOffset = $this->sigByteRangeOffset
+            + \strlen(self::SIG_BYTE_RANGE_PLACEHOLDER . ' /Contents ');
+        $this->doc->writeObject($this->sigDictId, $body);
     }
 
     private function pdfDate(): string
@@ -4131,17 +4148,23 @@ final class Document
         \assert($signature !== null);
 
         $reservedHex = $signature->reservedBytes * 2;
-        $pos = \strpos($bytes, '/Contents <');
-        if ($pos === false) {
-            throw SecurityException::encryptionFailed('Signature placeholder not found.');
+        $ltPos = $this->sigContentsOffset;  // byte offset of '<'
+        $gtPos = $ltPos + 1 + $reservedHex; // byte offset of '>'
+        $rangePos = $this->sigByteRangeOffset;
+        $rangeLength = \strlen(self::SIG_BYTE_RANGE_PLACEHOLDER);
+        if (
+            $ltPos < 0
+            || \substr($bytes, $ltPos, 1) !== '<'
+            || \substr($bytes, $gtPos, 1) !== '>'
+            || \substr($bytes, $rangePos, $rangeLength) !== self::SIG_BYTE_RANGE_PLACEHOLDER
+        ) {
+            throw SecurityException::encryptionFailed('Signature placeholder not found where it was written.');
         }
-        $ltPos = $pos + \strlen('/Contents '); // byte offset of '<'
-        $gtPos = $ltPos + 1 + $reservedHex;    // byte offset of '>'
         $fileLength = \strlen($bytes);
 
         // Fill the ByteRange in place (same byte length as its placeholder).
         $byteRange = \sprintf('[0 %010d %010d %010d]', $ltPos + 1, $gtPos, $fileLength - $gtPos);
-        $bytes = \str_replace('[0 0000000000 0000000000 0000000000]', $byteRange, $bytes);
+        $bytes = \substr_replace($bytes, $byteRange, $rangePos, $rangeLength);
 
         // Sign everything except the Contents hex string.
         $signedData = \substr($bytes, 0, $ltPos + 1) . \substr($bytes, $gtPos, $fileLength - $gtPos);

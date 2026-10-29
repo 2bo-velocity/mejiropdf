@@ -23,6 +23,11 @@ namespace MejiroPDF\Security;
  * password** unlocks full permissions. Leave the user password empty to allow
  * anyone to open the file while still restricting permissions with the owner
  * password.
+ *
+ * Leaving the owner password empty does **not** let the user password stand in
+ * for it: a random owner password is generated and discarded, so the
+ * permissions hold for every reader and nobody can lift them afterwards. Pass
+ * one explicitly to keep that ability for yourself.
  */
 final readonly class Encryption
 {
@@ -44,7 +49,7 @@ final readonly class Encryption
 
     /**
      * Encrypt with a user password (required to open) and an optional owner
-     * password (defaults to the user password).
+     * password (when empty, a random one nobody knows — see the class note).
      */
     public static function withUserPassword(
         string $userPassword,
